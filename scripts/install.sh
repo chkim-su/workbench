@@ -65,6 +65,12 @@ install_prerequisites() {
       echo "[workbench-install] Updating package lists..."
       sudo apt-get update -qq 2>/dev/null || true
 
+      # Install common dependencies (curl, unzip needed for bun)
+      if ! command -v unzip >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        echo "[workbench-install] Installing curl and unzip..."
+        sudo apt-get install -y curl unzip >/dev/null 2>&1
+      fi
+
       # Node.js (via NodeSource LTS)
       if ! command -v node >/dev/null 2>&1; then
         echo "[workbench-install] Installing Node.js (LTS)..."
@@ -87,6 +93,12 @@ install_prerequisites() {
       fi
       ;;
     fedora|rhel|centos|rocky|almalinux)
+      # Install common dependencies (curl, unzip needed for bun)
+      if ! command -v unzip >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        echo "[workbench-install] Installing curl and unzip..."
+        sudo dnf install -y curl unzip >/dev/null 2>&1 || sudo yum install -y curl unzip >/dev/null 2>&1
+      fi
+
       # Node.js
       if ! command -v node >/dev/null 2>&1; then
         echo "[workbench-install] Installing Node.js..."
@@ -108,6 +120,12 @@ install_prerequisites() {
       fi
       ;;
     arch|manjaro)
+      # Install common dependencies (curl, unzip needed for bun)
+      if ! command -v unzip >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        echo "[workbench-install] Installing curl and unzip..."
+        sudo pacman -Sy --noconfirm curl unzip >/dev/null 2>&1
+      fi
+
       # Node.js
       if ! command -v node >/dev/null 2>&1; then
         echo "[workbench-install] Installing Node.js..."
