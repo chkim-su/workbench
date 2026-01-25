@@ -81,7 +81,7 @@ install_prerequisites() {
       # Bun
       if ! command -v bun >/dev/null 2>&1; then
         echo "[workbench-install] Installing Bun..."
-        curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
+        curl -fsSL https://bun.sh/install | bash
         export BUN_INSTALL="$HOME/.bun"
         export PATH="$BUN_INSTALL/bin:$PATH"
       fi
@@ -102,7 +102,7 @@ install_prerequisites() {
       # Bun
       if ! command -v bun >/dev/null 2>&1; then
         echo "[workbench-install] Installing Bun..."
-        curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
+        curl -fsSL https://bun.sh/install | bash
         export BUN_INSTALL="$HOME/.bun"
         export PATH="$BUN_INSTALL/bin:$PATH"
       fi
@@ -123,7 +123,7 @@ install_prerequisites() {
       # Bun
       if ! command -v bun >/dev/null 2>&1; then
         echo "[workbench-install] Installing Bun..."
-        curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
+        curl -fsSL https://bun.sh/install | bash
         export BUN_INSTALL="$HOME/.bun"
         export PATH="$BUN_INSTALL/bin:$PATH"
       fi
@@ -177,6 +177,12 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# Ensure bun is on PATH if already installed (e.g., from previous run)
+if [[ -d "$HOME/.bun/bin" && ":$PATH:" != *":$HOME/.bun/bin:"* ]]; then
+  export BUN_INSTALL="$HOME/.bun"
+  export PATH="$BUN_INSTALL/bin:$PATH"
+fi
+
 missing=0
 need_cmd node || missing=1
 need_cmd python3 || missing=1
@@ -185,6 +191,11 @@ need_cmd bun || missing=1
 if [[ "$missing" -ne 0 ]]; then
   echo "[workbench-install] Missing prerequisites detected. Attempting auto-install..."
   if install_prerequisites; then
+    # Ensure bun is on PATH after installation
+    if [[ -d "$HOME/.bun/bin" ]]; then
+      export BUN_INSTALL="$HOME/.bun"
+      export PATH="$BUN_INSTALL/bin:$PATH"
+    fi
     # Re-check after install
     missing=0
     need_cmd node || missing=1
