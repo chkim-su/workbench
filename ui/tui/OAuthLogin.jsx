@@ -366,16 +366,8 @@ export default function OAuthLogin({ onComplete, onCancel }) {
           <Box marginBottom={1}>
             <Text bold color="yellow">Copy this URL and open in browser:</Text>
           </Box>
-          <Box
-            borderStyle="double"
-            borderColor="cyan"
-            paddingX={1}
-            paddingY={1}
-            marginBottom={1}
-          >
-            <Text color="cyan" wrap="wrap">
-              {authUrl}
-            </Text>
+          <Box marginBottom={1}>
+            <Text color="cyan" wrap="wrap">{authUrl}</Text>
           </Box>
 
           <Box marginBottom={1}>

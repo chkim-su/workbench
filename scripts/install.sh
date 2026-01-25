@@ -91,6 +91,14 @@ install_prerequisites() {
         export BUN_INSTALL="$HOME/.bun"
         export PATH="$BUN_INSTALL/bin:$PATH"
       fi
+
+      # Docker (optional but recommended)
+      if ! command -v docker >/dev/null 2>&1; then
+        echo "[workbench-install] Installing Docker..."
+        sudo apt-get install -y docker.io >/dev/null 2>&1
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
+        echo "[workbench-install] Docker installed. You may need to log out and back in for group permissions."
+      fi
       ;;
     fedora|rhel|centos|rocky|almalinux)
       # Install common dependencies (curl, unzip needed for bun)
@@ -118,6 +126,16 @@ install_prerequisites() {
         export BUN_INSTALL="$HOME/.bun"
         export PATH="$BUN_INSTALL/bin:$PATH"
       fi
+
+      # Docker (optional but recommended)
+      if ! command -v docker >/dev/null 2>&1; then
+        echo "[workbench-install] Installing Docker..."
+        sudo dnf install -y docker >/dev/null 2>&1 || sudo yum install -y docker >/dev/null 2>&1
+        sudo systemctl enable docker >/dev/null 2>&1 || true
+        sudo systemctl start docker >/dev/null 2>&1 || true
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
+        echo "[workbench-install] Docker installed. You may need to log out and back in for group permissions."
+      fi
       ;;
     arch|manjaro)
       # Install common dependencies (curl, unzip needed for bun)
@@ -144,6 +162,16 @@ install_prerequisites() {
         curl -fsSL https://bun.sh/install | bash
         export BUN_INSTALL="$HOME/.bun"
         export PATH="$BUN_INSTALL/bin:$PATH"
+      fi
+
+      # Docker (optional but recommended)
+      if ! command -v docker >/dev/null 2>&1; then
+        echo "[workbench-install] Installing Docker..."
+        sudo pacman -Sy --noconfirm docker >/dev/null 2>&1
+        sudo systemctl enable docker >/dev/null 2>&1 || true
+        sudo systemctl start docker >/dev/null 2>&1 || true
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
+        echo "[workbench-install] Docker installed. You may need to log out and back in for group permissions."
       fi
       ;;
     *)
