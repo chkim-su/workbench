@@ -26,6 +26,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Ensure bun is in PATH if installed (common install location)
+if [[ -d "$HOME/.bun/bin" && ":$PATH:" != *":$HOME/.bun/bin:"* ]]; then
+  export BUN_INSTALL="$HOME/.bun"
+  export PATH="$BUN_INSTALL/bin:$PATH"
+fi
+
 WORKBENCH_TMUX_SESSION="${WORKBENCH_TMUX_SESSION:-workbench}"
 
 ensure_tmux_session() {
