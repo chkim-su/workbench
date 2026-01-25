@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "workbench.registry",
+  "description": "Local MCP server registry + auto-discovery.",
+  "transport": "stdio",
+  "command": ["bun", "mcp/servers/registry/src/index.js"],
+  "cwd": "."
+}

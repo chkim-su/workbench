@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  workbench:
+    build:
+      context: ../..
+      dockerfile: docker/workbench/Dockerfile
+    image: myworkbench:latest
+    container_name: myworkbench
+    stdin_open: true
+    tty: true
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - WORKBENCH_PROVIDER=${WORKBENCH_PROVIDER:-claude-code}
+    volumes:
+      # Mount your project directory
+      - ${PROJECT_DIR:-.}:/work
+      # Persist workbench state
+      - workbench-state:/home/workbench/.workbench
+      # Mount OAuth pool if using Codex
+      - ${OAUTH_POOL_PATH:-/dev/null}:/home/workbench/.workbench/auth/openai_codex_oauth_pool.json:ro
+      # Optional: Mount Docker socket for nested containers
+      # - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /work
+    # Interactive TUI mode
+    command: ["node", "/app/ui/tui/index.js"]
+
+volumes:
+  workbench-state:

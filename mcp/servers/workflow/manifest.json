@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "workbench.workflow",
+  "description": "Workflow wrapper: upload/validate/status/update.",
+  "transport": "stdio",
+  "command": ["bun", "mcp/servers/workflow/src/index.js"],
+  "cwd": "."
+}

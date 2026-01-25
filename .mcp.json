@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "workbench-workbench-docker": {
+      "command": "bun",
+      "args": ["mcp/servers/workbench-docker/src/index.js"],
+      "env": {
+        "WORKBENCH_DOCKER_IMAGE": "myworkbench:latest",
+        "WORKBENCH_STATE_DIR": ".workbench"
+      }
+    }
+  }
+}

@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  claude-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: claude-sandbox:base
+    container_name: claude-sandbox-default
+
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+    volumes:
+      - ../workspace:/work:rw
+
+    environment:
+      - NODE_ENV=development
+      - CLAUDE_CONFIG_DIR=/home/claude/.claude
+      - TERM=xterm-256color
+
+    working_dir: /work
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+    tmpfs:
+      - /tmp:size=256M,mode=1777
+

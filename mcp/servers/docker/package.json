@@ -1,0 +1,9 @@
+{
+  "name": "@workbench/mcp-docker",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "start": "bun src/index.js"
+  }
+}

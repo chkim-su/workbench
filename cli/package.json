@@ -1,0 +1,26 @@
+{
+  "name": "@myworkbench/cli",
+  "version": "0.1.0",
+  "description": "CLI-first interface for My LLM Workbench",
+  "type": "module",
+  "bin": {
+    "workbench": "./src/index.js"
+  },
+  "main": "./src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "lint": "eslint src/",
+    "test": "node --test test/"
+  },
+  "keywords": [
+    "cli",
+    "llm",
+    "workbench",
+    "workflow"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {}
+}

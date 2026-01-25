@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "workbench.docker",
+  "description": "Docker harness operations (version/ps/logs).",
+  "transport": "stdio",
+  "command": ["bun", "mcp/servers/docker/src/index.js"],
+  "cwd": "."
+}

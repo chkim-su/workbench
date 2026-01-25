@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "workbench.workbench_docker",
+  "description": "Controls dockerized My LLM Workbench instances (start/exec/chat/logs).",
+  "transport": "stdio",
+  "command": ["bun", "mcp/servers/workbench-docker/src/index.js"],
+  "cwd": "."
+}
