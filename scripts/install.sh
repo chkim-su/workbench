@@ -277,6 +277,44 @@ if [[ -d "$HOME/.bun/bin" && ":$PATH:" != *":$HOME/.bun/bin:"* ]]; then
   export PATH="$BUN_INSTALL/bin:$PATH"
 fi
 
+# Install Go if not present (required for Bubble Tea TUI)
+install_go_if_missing() {
+  if command -v go >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local OS=""
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    OS="$ID"
+  fi
+
+  echo "[workbench-install] Installing Go..."
+  case "$OS" in
+    ubuntu|debian)
+      sudo apt-get update -qq 2>/dev/null || true
+      sudo apt-get install -y golang-go >/dev/null 2>&1
+      ;;
+    fedora|rhel|centos|rocky|almalinux)
+      sudo dnf install -y golang >/dev/null 2>&1 || sudo yum install -y golang >/dev/null 2>&1
+      ;;
+    arch|manjaro)
+      sudo pacman -Sy --noconfirm go >/dev/null 2>&1
+      ;;
+    *)
+      echo "[workbench-install] WARNING: Cannot auto-install Go on ${OS:-unknown}"
+      echo "[workbench-install] Install manually: https://go.dev/dl/"
+      return 1
+      ;;
+  esac
+
+  if command -v go >/dev/null 2>&1; then
+    echo "[workbench-install] Go installed successfully."
+  else
+    echo "[workbench-install] WARNING: Go installation may have failed."
+  fi
+}
+
 # Install Docker if not present (separate from other prerequisites)
 install_docker_if_missing() {
   if command -v docker >/dev/null 2>&1; then
@@ -356,6 +394,9 @@ if [[ ! -f ".workbench/state/current.json" ]]; then
   echo '{"schemaVersion":1,"updatedAt":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > ".workbench/state/current.json"
 fi
 
+# Install Go (required for Bubble Tea TUI with reasoning traces)
+install_go_if_missing || true
+
 # Install Docker (optional but recommended for full verification)
 install_docker_if_missing || true
 
@@ -363,6 +404,14 @@ echo "[workbench-install] Log: $LOG_PATH"
 echo "[workbench-install] node=$(node --version)"
 echo "[workbench-install] python=$(python3 --version)"
 echo "[workbench-install] bun=$(bun --version)"
+
+# Check for Go (required for Bubble Tea TUI)
+if command -v go >/dev/null 2>&1; then
+  echo "[workbench-install] go=$(go version | awk '{print $3}')"
+else
+  echo "[workbench-install] WARNING: go not found"
+  echo "[workbench-install]   The Bubble Tea TUI requires Go. Using legacy Ink TUI."
+fi
 
 # Check for tmux (optional but recommended for 4-pane layout)
 if command -v tmux >/dev/null 2>&1; then
