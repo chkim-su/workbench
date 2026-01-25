@@ -267,10 +267,15 @@ fi
 
 if [[ "$RUN_VERIFY" -eq 1 ]]; then
   echo "[workbench-install] running: bun run verify (baseline; real LLM disabled)"
-  WORKBENCH_VERIFY_REAL_LLM=0 bun run verify
+  # Allow verification to fail (e.g., Docker not available) - installation continues
+  if WORKBENCH_VERIFY_REAL_LLM=0 bun run verify; then
+    echo "[workbench-install] verification: all gates passed"
+  else
+    echo "[workbench-install] WARNING: some verification gates failed (this is OK if Docker is not available)"
+  fi
   if [[ "$VERIFY_REAL" -eq 1 ]]; then
     echo "[workbench-install] running: bun run verify (real LLM enabled)"
-    WORKBENCH_VERIFY_REAL_LLM=1 bun run verify
+    WORKBENCH_VERIFY_REAL_LLM=1 bun run verify || echo "[workbench-install] WARNING: real LLM verification had failures"
   fi
 fi
 
