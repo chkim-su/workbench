@@ -277,6 +277,48 @@ if [[ -d "$HOME/.bun/bin" && ":$PATH:" != *":$HOME/.bun/bin:"* ]]; then
   export PATH="$BUN_INSTALL/bin:$PATH"
 fi
 
+# Install Docker if not present (separate from other prerequisites)
+install_docker_if_missing() {
+  if command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local OS=""
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    OS="$ID"
+  fi
+
+  echo "[workbench-install] Installing Docker..."
+  case "$OS" in
+    ubuntu|debian)
+      sudo apt-get update -qq 2>/dev/null || true
+      sudo apt-get install -y docker.io >/dev/null 2>&1
+      ;;
+    fedora|rhel|centos|rocky|almalinux)
+      sudo dnf install -y docker >/dev/null 2>&1 || sudo yum install -y docker >/dev/null 2>&1
+      sudo systemctl enable docker >/dev/null 2>&1 || true
+      sudo systemctl start docker >/dev/null 2>&1 || true
+      ;;
+    arch|manjaro)
+      sudo pacman -Sy --noconfirm docker >/dev/null 2>&1
+      sudo systemctl enable docker >/dev/null 2>&1 || true
+      sudo systemctl start docker >/dev/null 2>&1 || true
+      ;;
+    *)
+      echo "[workbench-install] WARNING: Cannot auto-install Docker on ${OS:-unknown}"
+      return 1
+      ;;
+  esac
+
+  if command -v docker >/dev/null 2>&1; then
+    sudo usermod -aG docker "$USER" 2>/dev/null || true
+    echo "[workbench-install] Docker installed. Log out and back in for group permissions."
+  else
+    echo "[workbench-install] WARNING: Docker installation may have failed."
+  fi
+}
+
 missing=0
 need_cmd node || missing=1
 need_cmd python3 || missing=1
@@ -314,6 +356,9 @@ if [[ ! -f ".workbench/state/current.json" ]]; then
   echo '{"schemaVersion":1,"updatedAt":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > ".workbench/state/current.json"
 fi
 
+# Install Docker (optional but recommended for full verification)
+install_docker_if_missing || true
+
 echo "[workbench-install] Log: $LOG_PATH"
 echo "[workbench-install] node=$(node --version)"
 echo "[workbench-install] python=$(python3 --version)"
@@ -325,7 +370,14 @@ if command -v tmux >/dev/null 2>&1; then
 else
   echo "[workbench-install] WARNING: tmux not found"
   echo "[workbench-install]   The TUI will work but without the 4-pane layout."
-  echo "[workbench-install]   Install tmux for the best experience: https://github.com/tmux/tmux"
+fi
+
+# Check for docker
+if command -v docker >/dev/null 2>&1; then
+  echo "[workbench-install] docker=$(docker --version | head -1)"
+else
+  echo "[workbench-install] WARNING: docker not found"
+  echo "[workbench-install]   Docker MCP features will not be available."
 fi
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
