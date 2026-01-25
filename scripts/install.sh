@@ -9,11 +9,52 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Update from git if this is a git repo
+update_from_git() {
+  if [[ -d "$ROOT/.git" ]]; then
+    if command -v git >/dev/null 2>&1; then
+      echo "[workbench-install] Checking for updates..."
+      local current_commit
+      current_commit="$(git rev-parse HEAD 2>/dev/null || echo "")"
+
+      if git fetch origin main >/dev/null 2>&1; then
+        local remote_commit
+        remote_commit="$(git rev-parse origin/main 2>/dev/null || echo "")"
+
+        if [[ -n "$current_commit" && -n "$remote_commit" && "$current_commit" != "$remote_commit" ]]; then
+          echo "[workbench-install] Updates available. Pulling latest..."
+          if git pull origin main 2>&1; then
+            echo "[workbench-install] Updated to latest version."
+            # Re-exec the updated script
+            echo "[workbench-install] Restarting with updated installer..."
+            exec bash "$0" "$@"
+          else
+            echo "[workbench-install] WARNING: git pull failed. Continuing with current version."
+          fi
+        else
+          echo "[workbench-install] Already up to date."
+        fi
+      else
+        echo "[workbench-install] WARNING: Could not fetch updates. Continuing with current version."
+      fi
+    fi
+  fi
+}
+
 usage() {
   cat <<'EOF'
-Usage: scripts/install.sh [--check] [--skip-bun-install] [--no-launch]
+Usage: scripts/install.sh [options]
 
-Installs repo dependencies (bun workspaces) and performs basic environment checks.
+Installs or updates My LLM Workbench and its dependencies.
+
+Options:
+  --check            Check prerequisites only
+  --skip-bun-install Skip bun install step
+  --no-launch        Don't launch TUI after install
+  --no-verify        Skip verification gates
+  --no-update        Skip git pull update check
+  --no-pause         Don't pause for Enter at end
+  -h, --help         Show this help
 
 EOF
 }
@@ -36,9 +77,16 @@ for arg in "$@"; do
     --launch) LAUNCH=1 ;;
     --no-launch) LAUNCH=0 ;;
     -h|--help) usage; exit 0 ;;
+    --no-update) NO_UPDATE=1 ;;
     *) echo "Unknown arg: $arg" >&2; usage; exit 2 ;;
   esac
 done
+
+# Check for updates (unless --no-update is passed)
+NO_UPDATE="${NO_UPDATE:-0}"
+if [[ "$NO_UPDATE" -eq 0 ]]; then
+  update_from_git "$@"
+fi
 
 need_cmd() {
   local c="$1"
