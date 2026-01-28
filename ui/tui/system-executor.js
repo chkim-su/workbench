@@ -15,9 +15,17 @@
 
 import fs from "node:fs"
 import path from "node:path"
-import crypto from "node:crypto"
 import { spawn, spawnSync } from "node:child_process"
 import { StdioJsonRpcClient } from "../../mcp/kit/src/stdio-client.js"
+import {
+  ensureDir,
+  readJson,
+  writeJson,
+  appendJsonl,
+  nowIso,
+  ensureSessionId,
+  readCurrentSessionId,
+} from "./utils/index.js"
 
 function parseArgs(argv) {
   const out = { stateDir: null, repoRoot: process.cwd() }
@@ -27,55 +35,6 @@ function parseArgs(argv) {
     else if (a === "--repo-root") out.repoRoot = argv[++i]
   }
   return out
-}
-
-function ensureDir(p) {
-  fs.mkdirSync(p, { recursive: true })
-}
-
-function readJson(p) {
-  return JSON.parse(fs.readFileSync(p, "utf8"))
-}
-
-function writeJson(p, obj, mode = 0o644) {
-  ensureDir(path.dirname(p))
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + "\n", { encoding: "utf8", mode })
-}
-
-function appendJsonl(p, obj, mode = 0o644) {
-  ensureDir(path.dirname(p))
-  fs.appendFileSync(p, JSON.stringify(obj) + "\n", { encoding: "utf8", mode })
-}
-
-function nowIso() {
-  return new Date().toISOString()
-}
-
-function randomSessionId() {
-  return `sess_${crypto.randomBytes(4).toString("hex")}`
-}
-
-function readCurrentSessionId(stateDir) {
-  const currentPath = path.join(stateDir, "state", "current.json")
-  ensureDir(path.dirname(currentPath))
-  let cur = { schemaVersion: 1 }
-  if (fs.existsSync(currentPath)) {
-    try {
-      cur = readJson(currentPath)
-    } catch {}
-  }
-  if (typeof cur.sessionId === "string" && cur.sessionId.trim()) return cur.sessionId.trim()
-  return ""
-}
-
-function ensureSessionId(stateDir) {
-  const existing = readCurrentSessionId(stateDir)
-  if (existing) return existing
-  const currentPath = path.join(stateDir, "state", "current.json")
-  ensureDir(path.dirname(currentPath))
-  const cur = { schemaVersion: 1, sessionId: randomSessionId(), updatedAt: nowIso() }
-  writeJson(currentPath, cur, 0o644)
-  return cur.sessionId
 }
 
 function safeName(s) {

@@ -11,6 +11,12 @@ import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, s
 import { fetchAllUsage, formatResetTime } from './usageFetcher.js';
 import { fetchTmuxStatus } from './tmuxStatus.js';
 import { fetchAllClaudeUsage, formatTokens, formatCost } from './claudeUsageFetcher.js';
+import {
+  formatTimeRemaining,
+  extractTokenInfo,
+  getProfileStatus,
+  safeReadJson,
+} from './utils/index.js';
 
 // 1s polling for responsive timer updates and account switch detection
 const POLL_INTERVAL_MS = 1000;
@@ -75,80 +81,8 @@ function pointInRect(col0, row0, rect) {
   );
 }
 
-function formatTimeRemaining(ms) {
-  if (ms <= 0) return null;
-  const seconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-
-  if (days > 0) {
-    return `${days}d${hours % 24}h`;
-  }
-  if (hours > 0) {
-    return `${hours}h${minutes % 60}m${seconds % 60}s`;
-  }
-  if (minutes > 0) {
-    return `${minutes}m${seconds % 60}s`;
-  }
-  return `${seconds}s`;
-}
-
-function extractTokenInfo(token) {
-  if (!token) return null;
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
-    return {
-      email: payload['https://api.openai.com/profile']?.email || payload.email || null,
-      plan: payload['https://api.openai.com/auth']?.chatgpt_plan_type || null,
-      exp: payload.exp ? payload.exp * 1000 : null, // Convert to ms
-    };
-  } catch {
-    return null;
-  }
-}
-
-function formatTimeUntil(ms) {
-  if (!ms) return null;
-  const now = Date.now();
-  const diff = ms - now;
-  if (diff <= 0) return 'expired';
-
-  const hours = Math.floor(diff / (1000 * 60 * 60));
-  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-
-  if (hours > 24) {
-    const days = Math.floor(hours / 24);
-    return `${days}d ${hours % 24}h`;
-  }
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  return `${minutes}m`;
-}
-
-function getProfileStatus(profile) {
-  const now = Date.now();
-  if (profile.rateLimitedUntilMs && profile.rateLimitedUntilMs > now) {
-    const remaining = profile.rateLimitedUntilMs - now;
-    return { status: 'limited', color: 'yellow', icon: '!', text: `Rate limited (${formatTimeRemaining(remaining)})` };
-  }
-  if (profile.disabled || profile.enabled === false) {
-    return { status: 'disabled', color: 'gray', icon: '-', text: 'Disabled' };
-  }
-  if (profile.expiresAtMs && profile.expiresAtMs < now) {
-    return { status: 'expired', color: 'red', icon: 'x', text: 'Expired' };
-  }
-  return { status: 'ready', color: 'green', icon: '●', text: 'Ready' };
-}
-
-function safeReadJson(path) {
-  try {
-    return JSON.parse(readFileSync(path, 'utf8'));
-  } catch {
-    return null;
-  }
-}
+// getProfileStatus returns 'rate_limited' - normalize to 'limited' for legacy compatibility
+// in component code where needed
 
 function UsageBar({ percentage, width = 10 }) {
   const filled = Math.round((percentage / 100) * width);
@@ -178,7 +112,7 @@ const OAuthSection = memo(function OAuthSection({ oauthPool, usageData, maxProfi
 
   const profiles = Object.entries(oauthPool.profiles || {});
   const readyCount = profiles.filter(([, p]) => getProfileStatus(p).status === 'ready').length;
-  const limitedCount = profiles.filter(([, p]) => getProfileStatus(p).status === 'limited').length;
+  const limitedCount = profiles.filter(([, p]) => getProfileStatus(p).status === 'rate_limited').length;
   const lastUsed = oauthPool.selection?.lastUsedProfile;
   const pinned = oauthPool.selection?.pinnedProfile;
   const strategy = oauthPool.selection?.strategy || 'round-robin';
@@ -260,7 +194,7 @@ const OAuthSection = memo(function OAuthSection({ oauthPool, usageData, maxProfi
                   {status.status === 'ready' && (
                     <Text dimColor>usage: fetching...</Text>
                   )}
-                  {status.status === 'limited' && (
+                  {status.status === 'rate_limited' && (
                     <Text color="yellow">rate limited: {status.text.match(/\(([^)]+)\)/)?.[1] || '?'}</Text>
                   )}
                   {status.status === 'expired' && (
