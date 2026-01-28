@@ -1,6 +1,10 @@
 # Workbench state and artifacts
 .workbench/
 .workbench_devtest/
+.workbench_cache_test/
+
+# Playwright MCP artifacts
+.playwright-mcp/
 
 # Serena MCP state
 .serena/
