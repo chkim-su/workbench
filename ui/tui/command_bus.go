@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,12 @@ type busCommand struct {
 	Type    string `json:"type"`
 	Text    string `json:"text,omitempty"`
 	Keys    string `json:"keys,omitempty"`
+	Mode    string `json:"mode,omitempty"`   // A|B
+	Runtime string `json:"runtime,omitempty"` // codex-chat|codex-cli|opencode-run|...
+	Model   string `json:"model,omitempty"`  // model selection string (e.g., gpt-5.2)
+	PermissionMode string `json:"permissionMode,omitempty"` // plan|bypass
+	// ThoughtStream is optional to preserve backward compatibility; if omitted it won't change.
+	ThoughtStream *bool `json:"thoughtStream,omitempty"`
 	Source  string `json:"source,omitempty"` // cli|tui|system
 }
 
@@ -108,6 +115,61 @@ func (m appModel) applyBusCommand(c busCommand) (appModel, tea.Cmd) {
 		m = m.closeAllOverlays()
 		m.quitRequested = true
 		return m, tea.Quit
+	case "set":
+		changed := false
+		if s := strings.ToUpper(strings.TrimSpace(c.Mode)); s != "" {
+			if s == "A" {
+				m.mode = modeA
+				changed = true
+				m.systemAlert(alertInfo, "dev.set.mode", "Mode set to A", map[string]any{"source": src})
+			} else if s == "B" {
+				m.mode = modeB
+				changed = true
+				m.systemAlert(alertInfo, "dev.set.mode", "Mode set to B", map[string]any{"source": src})
+			} else {
+				m.systemAlert(alertWarn, "dev.set.mode.invalid", "Invalid mode (expected A or B)", map[string]any{"mode": c.Mode, "source": src})
+			}
+		}
+		if r := strings.TrimSpace(c.Runtime); r != "" {
+			found := false
+			for _, opt := range runtimeOptionsUnified() {
+				if opt.ID == r {
+					found = true
+					break
+				}
+			}
+			if found {
+				m.selectedRuntime = r
+				changed = true
+				compat := getCompatibilityLabel(m.selectedProvider, m.selectedRuntime)
+				m.systemAlert(alertInfo, "dev.set.runtime", fmt.Sprintf("Runtime set to %s (%s)", m.selectedRuntimeLabel(), compat), map[string]any{"runtime": r, "compatibility": compat, "source": src})
+			} else {
+				m.systemAlert(alertWarn, "dev.set.runtime.invalid", "Unknown runtime id", map[string]any{"runtime": r, "source": src})
+			}
+		}
+		if s := strings.TrimSpace(c.Model); s != "" {
+			m.selectedModel = s
+			changed = true
+			m.systemAlert(alertInfo, "dev.set.model", "Model set to "+s, map[string]any{"model": s, "source": src})
+		}
+		if pm := strings.ToLower(strings.TrimSpace(c.PermissionMode)); pm != "" {
+			if pm == "plan" || pm == "bypass" {
+				m.permissionMode = pm
+				changed = true
+				m.systemAlert(alertInfo, "dev.set.permission_mode", "Permission mode set to "+m.permissionModeLabel(), map[string]any{"permissionMode": pm, "source": src})
+			} else {
+				m.systemAlert(alertWarn, "dev.set.permission_mode.invalid", "Invalid permissionMode (expected plan or bypass)", map[string]any{"permissionMode": c.PermissionMode, "source": src})
+			}
+		}
+		if c.ThoughtStream != nil {
+			m.thoughtStream = *c.ThoughtStream
+			changed = true
+			m.systemAlert(alertInfo, "dev.set.thought_stream", "Thought stream updated", map[string]any{"enabled": m.thoughtStream, "source": src})
+		}
+		if !changed {
+			m.systemAlert(alertWarn, "dev.set.noop", "Set command contained no changes", map[string]any{"source": src})
+		}
+		return m, nil
 	case "send":
 		txt := strings.TrimSpace(c.Text)
 		if txt == "" {
@@ -174,6 +236,8 @@ func (m appModel) applySyntheticKey(token string) (appModel, tea.Cmd) {
 		msg = tea.KeyMsg{Type: tea.KeyDown}
 	case "tab":
 		msg = tea.KeyMsg{Type: tea.KeyTab}
+	case "shift+tab", "shift-tab", "shifttab":
+		msg = tea.KeyMsg{Type: tea.KeyShiftTab}
 	case "backspace":
 		msg = tea.KeyMsg{Type: tea.KeyBackspace}
 	default:

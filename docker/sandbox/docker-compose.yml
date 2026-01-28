@@ -19,7 +19,7 @@ services:
 
     environment:
       - NODE_ENV=development
-      - CLAUDE_CONFIG_DIR=/home/claude/.claude
+      - CLAUDE_CONFIG_DIR=/home/llm/.claude
       - TERM=xterm-256color
 
     working_dir: /work

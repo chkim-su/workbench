@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -161,6 +164,7 @@ type appModel struct {
 	chatCancel context.CancelFunc
 	chatCorrelationID string
 	chatActiveProfile string
+	chatScrollOffset int // lines from bottom; 0 = follow
 	alerts    []systemAlert
 
 	recentCommands []string
@@ -200,6 +204,7 @@ type appModel struct {
 	opencodeEventsOffset     int64
 	opencodeExecutorReady    bool
 
+	permissionMode string // plan|bypass
 	thoughtStream bool
 	chatStreamText string
 
@@ -210,6 +215,33 @@ type appModel struct {
 	systemInFlight bool
 	systemCorrelationID string
 	systemLastResult *systemResponse
+}
+
+func (m appModel) chatRoleLinesMax() int {
+	// Keep chat history reasonably large so long outputs (verification, code diffs, etc.)
+	// remain inspectable via scrollback. Still capped to avoid runaway memory.
+	max := 2000
+	if v := strings.TrimSpace(os.Getenv("WORKBENCH_TUI_CHAT_HISTORY_MAX")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			max = n
+		}
+	}
+	// Guardrails.
+	if max < 100 {
+		max = 100
+	}
+	if max > 20000 {
+		max = 20000
+	}
+	return max
+}
+
+func (m appModel) trimChatRoleLines() appModel {
+	max := m.chatRoleLinesMax()
+	if len(m.chatRoleLines) > max {
+		m.chatRoleLines = m.chatRoleLines[len(m.chatRoleLines)-max:]
+	}
+	return m
 }
 
 func newAppModel(cfg appConfig) appModel {
@@ -248,6 +280,7 @@ func newAppModel(cfg appConfig) appModel {
 		opencodeResponsesPath: cfg.opencodeResponsesPath,
 		opencodeEventsPath:    cfg.opencodeEventsPath,
 
+		permissionMode: "plan",
 		thoughtStream: thoughtStreamEnabled(),
 	}
 	m.commandBusOffset = initCommandBus(cfg.commandsPath)
@@ -255,6 +288,72 @@ func newAppModel(cfg appConfig) appModel {
 	m.opencodeResponsesOffset, m.opencodeEventsOffset = initOpencodeBus(cfg.opencodeResponsesPath, cfg.opencodeRequestsPath, cfg.opencodeEventsPath)
 	m.systemResponsesOffset = initSystemBus(cfg.systemResponsesPath, cfg.systemRequestsPath)
 	m.systemAlert(alertInfo, "workbench.started", "Workbench shell started", nil)
+	return m
+}
+
+func (m appModel) startNewSession() appModel {
+	id, err := createNewSessionID(m.cfg.stateDir)
+	if err != nil {
+		m.systemAlert(alertError, "session.new.failed", "Failed to create new session", map[string]any{"error": err.Error()})
+		return m
+	}
+	if err := setCurrentSessionID(m.cfg.stateDir, id); err != nil {
+		m.systemAlert(alertWarn, "session.current.failed", "Failed to update current session pointer", map[string]any{"error": err.Error()})
+	}
+
+	m.sessionID = id
+	m.cfg.sessionID = id
+	m.mcpConnected = readMcpConnectedCount(m.cfg.stateDir)
+	m.cfg.mcpConnected = m.mcpConnected
+
+	// Reset bus paths to the new session namespace.
+	m.cfg.commandsPath = filepath.Join(m.cfg.stateDir, id, "commands.jsonl")
+	m.cfg.codexRequestsPath = filepath.Join(m.cfg.stateDir, id, "codex.requests.jsonl")
+	m.cfg.codexResponsesPath = filepath.Join(m.cfg.stateDir, id, "codex.responses.jsonl")
+	m.cfg.codexEventsPath = filepath.Join(m.cfg.stateDir, id, "codex.events.jsonl")
+	m.cfg.systemRequestsPath = filepath.Join(m.cfg.stateDir, id, "system.requests.jsonl")
+	m.cfg.systemResponsesPath = filepath.Join(m.cfg.stateDir, id, "system.responses.jsonl")
+	m.cfg.opencodeRequestsPath = filepath.Join(m.cfg.stateDir, id, "opencode.requests.jsonl")
+	m.cfg.opencodeResponsesPath = filepath.Join(m.cfg.stateDir, id, "opencode.responses.jsonl")
+	m.cfg.opencodeEventsPath = filepath.Join(m.cfg.stateDir, id, "opencode.events.jsonl")
+
+	m.commandBusPath = m.cfg.commandsPath
+	m.codexRequestsPath = m.cfg.codexRequestsPath
+	m.codexResponsesPath = m.cfg.codexResponsesPath
+	m.codexEventsPath = m.cfg.codexEventsPath
+	m.systemRequestsPath = m.cfg.systemRequestsPath
+	m.systemResponsesPath = m.cfg.systemResponsesPath
+	m.opencodeRequestsPath = m.cfg.opencodeRequestsPath
+	m.opencodeResponsesPath = m.cfg.opencodeResponsesPath
+	m.opencodeEventsPath = m.cfg.opencodeEventsPath
+
+	m.commandBusOffset = initCommandBus(m.commandBusPath)
+	m.codexResponsesOffset, m.codexEventsOffset = initCodexBus(m.codexResponsesPath, m.codexRequestsPath, m.codexEventsPath)
+	m.opencodeResponsesOffset, m.opencodeEventsOffset = initOpencodeBus(m.opencodeResponsesPath, m.opencodeRequestsPath, m.opencodeEventsPath)
+	m.systemResponsesOffset = initSystemBus(m.systemResponsesPath, m.systemRequestsPath)
+
+	// Clear transient state.
+	if m.chatCancel != nil {
+		m.chatCancel()
+		m.chatCancel = nil
+	}
+	m.chatInFlight = false
+	m.chatCorrelationID = ""
+	m.chatActiveProfile = ""
+	m.chatStreamText = ""
+	m.chatScrollOffset = 0
+	m.input = ""
+	m.chatLines = []string{}
+	m.chatRoleLines = []chatRoleLine{}
+	m.chatMessages = []chatMessage{}
+	m.alerts = []systemAlert{}
+	m.recentCommands = []string{}
+	m.systemInFlight = false
+	m.systemCorrelationID = ""
+	m.systemLastResult = nil
+
+	m.events = newEventLogger(m.cfg.stateDir, id)
+	m.systemAlert(alertInfo, "session.new", "New session started", map[string]any{"sessionId": id})
 	return m
 }
 
@@ -285,7 +384,11 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if strings.TrimSpace(t.Text) != "" {
+			if m.chatScrollOffset > 0 {
+				m.chatScrollOffset += m.chatWrappedLineCount("assistant", t.Text)
+			}
 			m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "assistant", Text: strings.TrimRight(t.Text, "\n")})
+			m = m.trimChatRoleLines()
 			m.chatMessages = append(m.chatMessages, chatMessage{Role: "assistant", Content: t.Text})
 			m.emitEvent("llm.response", "system", map[string]any{"provider": t.Provider, "profile": t.Profile, "status": t.Status}, t.CorrelationID, "")
 			m.emitEvent("chat.reply", "system", map[string]any{"provider": t.Provider, "text": t.Text}, t.CorrelationID, "")
@@ -381,6 +484,17 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m, cmd = m.onTick(now)
 		return m, cmd
 	case tea.KeyMsg:
+		// Global permission-mode toggle (cockpit only): Shift+Tab.
+		if t.Type == tea.KeyShiftTab && m.currentOverlay() == overlayNone && m.currentScreen() == screenCockpit {
+			if m.permissionMode == "bypass" {
+				m.permissionMode = "plan"
+			} else {
+				m.permissionMode = "bypass"
+			}
+			m.systemAlert(alertInfo, "permission_mode.toggled", "Permission mode: "+m.permissionModeLabel(), map[string]any{"permissionMode": m.permissionMode})
+			m.emitEvent("permission_mode.toggled", m.actionSource, map[string]any{"permissionMode": m.permissionMode}, "", "")
+			return m, nil
+		}
 		if t.String() == "esc" {
 			return m.handleEsc()
 		}
@@ -426,6 +540,15 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	default:
 		return m, nil
+	}
+}
+
+func (m appModel) permissionModeLabel() string {
+	switch strings.ToLower(strings.TrimSpace(m.permissionMode)) {
+	case "bypass":
+		return "Bypass (writes + shell)"
+	default:
+		return "Planning (read-only + shell)"
 	}
 }
 
@@ -760,22 +883,30 @@ func (m appModel) consumeCodexResponses(now time.Time) appModel {
 
 		if !r.Ok {
 			msg := nonEmpty(strings.TrimSpace(r.Error), "Codex runtime error")
-			m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "system", Text: msg})
-			if len(m.chatRoleLines) > 250 {
-				m.chatRoleLines = m.chatRoleLines[len(m.chatRoleLines)-250:]
+			if msg == "executor busy" {
+				msg = "executor busy — a Codex turn is already running (wait, or press Esc to cancel)"
 			}
+			if m.chatScrollOffset > 0 {
+				m.chatScrollOffset += m.chatWrappedLineCount("system", msg)
+			}
+			m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "system", Text: msg})
+			m = m.trimChatRoleLines()
 			m.systemAlert(alertError, "codex.runtime.error", msg, map[string]any{"correlationId": r.CorrelationID})
 			continue
 		}
 
 		if strings.TrimSpace(r.Content) != "" {
+			if m.chatScrollOffset > 0 {
+				m.chatScrollOffset += m.chatWrappedLineCount("assistant", r.Content)
+			}
 			m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "assistant", Text: strings.TrimRight(r.Content, "\n")})
 		} else {
+			if m.chatScrollOffset > 0 {
+				m.chatScrollOffset += 1
+			}
 			m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "assistant", Text: "(no content)"})
 		}
-		if len(m.chatRoleLines) > 250 {
-			m.chatRoleLines = m.chatRoleLines[len(m.chatRoleLines)-250:]
-		}
+		m = m.trimChatRoleLines()
 		if len(r.FileChanges) > 0 {
 			m.systemAlert(alertInfo, "codex.runtime.file_changes", fmt.Sprintf("Codex changed %d file(s)", len(r.FileChanges)), map[string]any{"files": r.FileChanges})
 		}
@@ -799,18 +930,36 @@ func (m appModel) consumeCodexEvents(now time.Time) appModel {
 			continue
 		}
 		kind := strings.TrimSpace(ev.Kind)
-		msg := strings.TrimSpace(ev.Message)
-		if msg == "" {
-			continue
-		}
 		if kind == "delta" {
-			m.chatStreamText += msg
+			if ev.Message == "" {
+				continue
+			}
+			before := m.chatStreamDisplayText()
+			beforeLines := 0
+			if strings.TrimSpace(before) != "" {
+				beforeLines = m.chatWrappedLineCount("assistant", before)
+			}
+
+			m.chatStreamText += ev.Message
 			if len(m.chatStreamText) > 4000 {
 				m.chatStreamText = m.chatStreamText[len(m.chatStreamText)-4000:]
+			}
+
+			after := m.chatStreamDisplayText()
+			afterLines := 0
+			if strings.TrimSpace(after) != "" {
+				afterLines = m.chatWrappedLineCount("assistant", after)
+			}
+			if m.chatScrollOffset > 0 {
+				m.chatScrollOffset = clamp(m.chatScrollOffset+(afterLines-beforeLines), 0, 1_000_000)
 			}
 			continue
 		}
 
+		msg := strings.TrimSpace(ev.Message)
+		if msg == "" {
+			continue
+		}
 		prefix := "Codex"
 		if kind == "think" {
 			prefix = "THINK"
@@ -818,10 +967,11 @@ func (m appModel) consumeCodexEvents(now time.Time) appModel {
 		if strings.TrimSpace(ev.Tool) != "" {
 			prefix = "Codex/" + strings.TrimSpace(ev.Tool)
 		}
-		m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "system", Text: prefix + ": " + msg})
-		if len(m.chatRoleLines) > 250 {
-			m.chatRoleLines = m.chatRoleLines[len(m.chatRoleLines)-250:]
+		if m.chatScrollOffset > 0 {
+			m.chatScrollOffset += m.chatWrappedLineCount("system", prefix+": "+msg)
 		}
+		m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "system", Text: prefix + ": " + msg})
+		m = m.trimChatRoleLines()
 	}
 	_ = now
 	return m
@@ -840,6 +990,28 @@ func (m appModel) consumeOpencodeEvents(now time.Time) appModel {
 		if m.chatCorrelationID == "" || ev.CorrelationID != m.chatCorrelationID {
 			continue
 		}
+		if strings.TrimSpace(ev.Kind) == "delta" {
+			before := m.chatStreamDisplayText()
+			beforeLines := 0
+			if strings.TrimSpace(before) != "" {
+				beforeLines = m.chatWrappedLineCount("assistant", before)
+			}
+
+			m.chatStreamText += ev.Message
+			if len(m.chatStreamText) > 4000 {
+				m.chatStreamText = m.chatStreamText[len(m.chatStreamText)-4000:]
+			}
+
+			after := m.chatStreamDisplayText()
+			afterLines := 0
+			if strings.TrimSpace(after) != "" {
+				afterLines = m.chatWrappedLineCount("assistant", after)
+			}
+			if m.chatScrollOffset > 0 {
+				m.chatScrollOffset = clamp(m.chatScrollOffset+(afterLines-beforeLines), 0, 1_000_000)
+			}
+			continue
+		}
 		msg := strings.TrimSpace(ev.Message)
 		if msg == "" {
 			continue
@@ -851,10 +1023,11 @@ func (m appModel) consumeOpencodeEvents(now time.Time) appModel {
 		if strings.TrimSpace(ev.Tool) != "" {
 			prefix = "OpenCode/" + strings.TrimSpace(ev.Tool)
 		}
-		m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "system", Text: prefix + ": " + msg})
-		if len(m.chatRoleLines) > 250 {
-			m.chatRoleLines = m.chatRoleLines[len(m.chatRoleLines)-250:]
+		if m.chatScrollOffset > 0 {
+			m.chatScrollOffset += m.chatWrappedLineCount("system", prefix+": "+msg)
 		}
+		m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "system", Text: prefix + ": " + msg})
+		m = m.trimChatRoleLines()
 	}
 	_ = now
 	return m
@@ -880,19 +1053,34 @@ func (m appModel) consumeOpencodeResponses(now time.Time) appModel {
 		m.chatInFlight = false
 		m.chatCorrelationID = ""
 		m.chatActiveProfile = ""
+		m.chatStreamText = ""
 
 		if !r.Ok {
 			msg := nonEmpty(strings.TrimSpace(r.Error), "OpenCode runtime error")
+			if msg == "executor busy" {
+				msg = "executor busy — an OpenCode turn is already running (wait, or press Esc to cancel)"
+			}
+			if m.chatScrollOffset > 0 {
+				m.chatScrollOffset += m.chatWrappedLineCount("system", msg)
+			}
 			m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "system", Text: msg})
+			m = m.trimChatRoleLines()
 			m.systemAlert(alertError, "opencode.runtime.error", msg, map[string]any{"correlationId": r.CorrelationID})
 			continue
 		}
 
 		if strings.TrimSpace(r.Content) != "" {
+			if m.chatScrollOffset > 0 {
+				m.chatScrollOffset += m.chatWrappedLineCount("assistant", r.Content)
+			}
 			m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "assistant", Text: strings.TrimRight(r.Content, "\n")})
 		} else {
+			if m.chatScrollOffset > 0 {
+				m.chatScrollOffset += 1
+			}
 			m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "assistant", Text: "(no content)"})
 		}
+		m = m.trimChatRoleLines()
 		if len(r.FileChanges) > 0 {
 			m.systemAlert(alertInfo, "opencode.runtime.file_changes", fmt.Sprintf("OpenCode changed %d file(s)", len(r.FileChanges)), map[string]any{"files": r.FileChanges})
 		}
@@ -1025,6 +1213,42 @@ func (m appModel) bumpProvider(delta int) appModel {
 }
 
 func (m appModel) updateCockpit(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Scrollback controls (do not interfere with text entry).
+	switch k.Type {
+	case tea.KeyPgUp, tea.KeyCtrlU, tea.KeyPgDown, tea.KeyCtrlD, tea.KeyHome, tea.KeyEnd, tea.KeyUp, tea.KeyDown:
+		if (k.Type == tea.KeyUp || k.Type == tea.KeyDown) && strings.TrimSpace(m.input) != "" {
+			break
+		}
+		w, h := m.effectiveSize()
+		header := renderHeader(m.th, m.cfg.applicationV, m.mcpConnected, m.sessionID)
+		statusBar := m.viewStatusBar(w)
+		chatHeight := h - lipgloss.Height(header) - lipgloss.Height(statusBar)
+		if chatHeight < 6 {
+			chatHeight = 6
+		}
+		innerW := chatInnerWidth(w)
+		maxOff := m.chatMaxScrollOffset(chatHeight, innerW)
+		step := m.chatHistoryMaxLines(chatHeight) / 2
+		if step < 1 {
+			step = 1
+		}
+		switch k.Type {
+		case tea.KeyPgUp, tea.KeyCtrlU:
+			m.chatScrollOffset = clamp(m.chatScrollOffset+step, 0, maxOff)
+		case tea.KeyPgDown, tea.KeyCtrlD:
+			m.chatScrollOffset = clamp(m.chatScrollOffset-step, 0, maxOff)
+		case tea.KeyUp:
+			m.chatScrollOffset = clamp(m.chatScrollOffset+1, 0, maxOff)
+		case tea.KeyDown:
+			m.chatScrollOffset = clamp(m.chatScrollOffset-1, 0, maxOff)
+		case tea.KeyHome:
+			m.chatScrollOffset = maxOff
+		case tea.KeyEnd:
+			m.chatScrollOffset = 0
+		}
+		return m, nil
+	}
+
 	if k.Type == tea.KeyEnter && strings.TrimSpace(m.input) == "" {
 		m = m.openOverlay(overlayQuickActions)
 		m.quickActionsVisible = true
@@ -1061,6 +1285,8 @@ func (m appModel) updateCockpit(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		line := strings.TrimSpace(m.input)
 		if line != "" {
+			// When submitting, return to follow mode so the response is visible.
+			m.chatScrollOffset = 0
 			if strings.HasPrefix(line, "/") {
 				var cmd tea.Cmd
 				m, cmd = m.executeCommandText(line)
@@ -1075,6 +1301,201 @@ func (m appModel) updateCockpit(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input = ""
 	}
 	return m, nil
+}
+
+func countVisualLines(raw string) int {
+	s := strings.TrimRight(raw, "\n")
+	if s == "" {
+		return 1
+	}
+	return len(strings.Split(s, "\n"))
+}
+
+func chatInnerWidth(totalWidth int) int {
+	// Chat panel uses:
+	// - overall width (totalWidth)
+	// - panel width = totalWidth-2 (keeps a 1-col margin on each side in the overall layout)
+	// - border = 2 cols (left+right)
+	// - padding = 2 cols (left+right, 1 each)
+	inner := totalWidth - 6
+	if inner < 10 {
+		inner = 10
+	}
+	return inner
+}
+
+func wrapChatBlock(prefixStyled string, indent string, raw string, innerWidth int) []string {
+	raw = strings.TrimRight(raw, "\n")
+	if raw == "" {
+		return []string{prefixStyled}
+	}
+
+	indentW := lipgloss.Width(indent)
+	avail := innerWidth - indentW
+	if avail < 5 {
+		avail = 5
+	}
+
+	wrap := lipgloss.NewStyle().Width(avail)
+
+	out := make([]string, 0, 8)
+	parts := strings.Split(raw, "\n")
+	for pi, p := range parts {
+		wrapped := wrap.Render(p)
+		lines := strings.Split(wrapped, "\n")
+		for li, l := range lines {
+			l = strings.TrimRight(l, " ")
+			if pi == 0 && li == 0 {
+				out = append(out, prefixStyled+l)
+				continue
+			}
+			out = append(out, indent+l)
+		}
+	}
+	return out
+}
+
+func styleChatContent(th theme, raw string) string {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	lines := strings.Split(raw, "\n")
+	for i := range lines {
+		lines[i] = styleChatLine(th, lines[i])
+	}
+	return strings.Join(lines, "\n")
+}
+
+func styleChatLine(th theme, line string) string {
+	if strings.TrimSpace(line) == "" {
+		return line
+	}
+
+	// Bullet marker styling (keeps indentation).
+	lead := 0
+	for lead < len(line) && (line[lead] == ' ' || line[lead] == '\t') {
+		lead++
+	}
+	indent := line[:lead]
+	rest := line[lead:]
+
+	marker := ""
+	switch {
+	case strings.HasPrefix(rest, "- "):
+		marker = "- "
+	case strings.HasPrefix(rest, "* "):
+		marker = "* "
+	case strings.HasPrefix(rest, "• "):
+		marker = "• "
+	default:
+		// Ordered list: "1. " or "1) "
+		di := 0
+		for di < len(rest) && unicode.IsDigit(rune(rest[di])) {
+			di++
+		}
+		if di > 0 && di+1 < len(rest) && (rest[di] == '.' || rest[di] == ')') && rest[di+1] == ' ' {
+			marker = rest[:di+2]
+		}
+	}
+	if marker != "" {
+		rest = th.Accent.Bold(true).Render(marker) + rest[len(marker):]
+		line = indent + rest
+	}
+
+	return styleBackticks(th, line)
+}
+
+func styleBackticks(th theme, line string) string {
+	// Lightweight markdown-ish highlighting:
+	// - `inline code` spans
+	// Avoid full markdown parsing to keep it deterministic and fast.
+	if !strings.Contains(line, "`") {
+		return line
+	}
+
+	var b strings.Builder
+	rest := line
+	for {
+		i := strings.IndexByte(rest, '`')
+		if i < 0 {
+			b.WriteString(rest)
+			break
+		}
+		b.WriteString(rest[:i])
+		rest = rest[i+1:]
+
+		j := strings.IndexByte(rest, '`')
+		if j < 0 {
+			// Unmatched tick: keep literal.
+			b.WriteString("`")
+			b.WriteString(rest)
+			break
+		}
+
+		code := rest[:j]
+		rest = rest[j+1:]
+
+		b.WriteString(th.Muted.Render("`"))
+		b.WriteString(styleCodeSpan(th, code))
+		b.WriteString(th.Muted.Render("`"))
+	}
+	return b.String()
+}
+
+func styleCodeSpan(th theme, code string) string {
+	trimmed := strings.TrimSpace(code)
+	if trimmed == "" {
+		return th.Muted.Render(code)
+	}
+
+	// Heuristics:
+	// - spans with whitespace are usually commands
+	// - spans without whitespace but with /, ./, file.ext, file:line are usually paths
+	if strings.ContainsAny(trimmed, " \t") {
+		return th.Accent.Bold(true).Render(code)
+	}
+	if looksLikePath(trimmed) {
+		return th.Alert.Bold(true).Render(code)
+	}
+	return th.Accent.Render(code)
+}
+
+func looksLikePath(s string) bool {
+	if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+		return true
+	}
+	if strings.Contains(s, "/") || strings.Contains(s, "\\") {
+		return true
+	}
+
+	// file:line or file:line:col
+	if strings.Contains(s, ":") && (strings.Contains(s, ".") || strings.Contains(s, "/") || strings.Contains(s, "\\")) {
+		return true
+	}
+
+	exts := []string{
+		".go", ".js", ".ts", ".jsx", ".tsx",
+		".json", ".jsonl", ".yaml", ".yml",
+		".md", ".sh", ".txt", ".toml",
+		".png", ".jpg", ".jpeg", ".gif",
+	}
+	for _, ext := range exts {
+		if strings.HasSuffix(strings.ToLower(s), ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m appModel) chatWrappedLineCount(role string, raw string) int {
+	w, _ := m.effectiveSize()
+	innerW := chatInnerWidth(w)
+	switch role {
+	case "user":
+		return len(wrapChatBlock(m.th.Accent.Render("You: "), "     ", raw, innerW))
+	case "assistant":
+		return len(wrapChatBlock(m.th.Success.Render("AI: "), "    ", raw, innerW))
+	default:
+		return len(wrapChatBlock(m.th.Muted.Render("[SYSTEM] "), "         ", raw, innerW))
+	}
 }
 
 func (m appModel) updateCommandPalette(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1181,6 +1602,10 @@ func (m appModel) applyCommandPalette(item paletteItem) (tea.Model, tea.Cmd) {
 			m.systemAlert(alertInfo, "mode.switched", fmt.Sprintf("Mode switched to %s", m.mode.String()), nil)
 			m = m.closeAllOverlays()
 			return m, nil
+		case "session":
+			m = m.startNewSession()
+			m = m.closeAllOverlays()
+			return m, nil
 		case "stats":
 			m = m.openOverlay(overlayStats)
 			return m, nil
@@ -1226,6 +1651,7 @@ func (m appModel) applyCommandPalette(item paletteItem) (tea.Model, tea.Cmd) {
 		m.chatLines = []string{}
 		m.chatRoleLines = []chatRoleLine{}
 		m.chatMessages = []chatMessage{}
+		m.chatScrollOffset = 0
 		m.systemAlert(alertInfo, "chat.cleared", "Chat cleared", nil)
 		m = m.closeAllOverlays()
 		return m, nil
@@ -1266,7 +1692,9 @@ func (m appModel) submitSystemVerify(full bool, correlationID string) (tea.Model
 	m.systemAlert(alertInfo, "system.verify.requested", "Verification requested", map[string]any{"full": full, "correlationId": cid})
 	m.emitEvent("command.submitted", m.actionSource, map[string]any{"namespace": "//", "text": cmdText}, cid, "")
 	m = m.closeAllOverlays()
-	m = m.openOverlay(overlaySystemInfo)
+	if m.shouldShowSystemOverlay() {
+		m = m.openOverlay(overlaySystemInfo)
+	}
 	return m, nil
 }
 
@@ -1295,7 +1723,9 @@ func (m appModel) submitSystemDockerProbe(correlationID string) (tea.Model, tea.
 	m.systemAlert(alertInfo, "system.docker.probe", "Docker probe requested", map[string]any{"correlationId": cid})
 	m.emitEvent("command.submitted", m.actionSource, map[string]any{"namespace": "//", "text": "//docker probe"}, cid, "")
 	m = m.closeAllOverlays()
-	m = m.openOverlay(overlaySystemInfo)
+	if m.shouldShowSystemOverlay() {
+		m = m.openOverlay(overlaySystemInfo)
+	}
 	return m, nil
 }
 
@@ -1311,8 +1741,9 @@ func (m appModel) sendChat(line string) (appModel, tea.Cmd) {
 
 	cid := newCorrelationID()
 	m.chatRoleLines = append(m.chatRoleLines, chatRoleLine{Role: "user", Text: txt})
+	m = m.trimChatRoleLines()
 	m.chatMessages = append(m.chatMessages, chatMessage{Role: "user", Content: txt})
-	m.emitEvent("chat.send", m.actionSource, map[string]any{"text": txt, "provider": m.selectedProvider, "runtime": m.selectedRuntime}, cid, "")
+	m.emitEvent("chat.send", m.actionSource, map[string]any{"text": txt, "provider": m.selectedProvider, "runtime": m.selectedRuntime, "permissionMode": m.permissionMode}, cid, "")
 
 	runtime := strings.TrimSpace(m.selectedRuntime)
 	provider := m.selectedProviderLabel()
@@ -1338,6 +1769,7 @@ func (m appModel) sendChat(line string) (appModel, tea.Cmd) {
 			m.chatInFlight = true
 			m.chatCorrelationID = cid
 			m.chatActiveProfile = m.oauthPool.ActiveProfile
+			m.chatStreamText = ""
 			model := codexModelForSelection(strings.TrimSpace(m.selectedModel))
 			cwd := extractCwdFromPrompt(txt)
 			if strings.TrimSpace(cwd) == "" {
@@ -1350,13 +1782,18 @@ func (m appModel) sendChat(line string) (appModel, tea.Cmd) {
 				Prompt:        txt,
 				Cwd:           cwd,
 				Model:         model,
-				NoShell:       true,
+				NoShell:       false,
 				Think:         m.thoughtStream,
+				PermissionMode: strings.ToLower(strings.TrimSpace(m.permissionMode)),
 			})
-			m.systemAlert(alertInfo, "codex.cli.turn", "Submitted to Codex CLI", map[string]any{"cwd": cwd, "model": model, "think": m.thoughtStream, "runtime": "codex-cli", "compatibility": compatLabel})
+			m.systemAlert(alertInfo, "codex.cli.turn", "Submitted to Codex CLI", map[string]any{"cwd": cwd, "model": model, "think": m.thoughtStream, "permissionMode": m.permissionMode, "runtime": "codex-cli", "compatibility": compatLabel})
 			return m, nil
 		}
-		m.systemAlert(alertError, "codex.cli.unavailable", "Codex CLI executor not ready", map[string]any{"hint": "Start workbench from a terminal with `codex` installed, or switch runtime to Codex – Chat Mode"})
+		diag := codexExecutorDiagnostic(m.cfg.stateDir, m.sessionID, m.now)
+		if diag == "" {
+			diag = "Start workbench from a terminal with `codex` installed, or switch runtime to Codex – Chat Mode"
+		}
+		m.systemAlert(alertError, "codex.cli.unavailable", diag, map[string]any{"hint": "switch runtime to Codex – Chat Mode if this persists"})
 		return m, nil
 	}
 
@@ -1368,6 +1805,7 @@ func (m appModel) sendChat(line string) (appModel, tea.Cmd) {
 			m.chatInFlight = true
 			m.chatCorrelationID = cid
 			m.chatActiveProfile = ""
+			m.chatStreamText = ""
 			model := opencodeModelForSelection(provider, strings.TrimSpace(m.selectedModel))
 			agent := opencodeAgent()
 			think := m.thoughtStream
@@ -1384,8 +1822,9 @@ func (m appModel) sendChat(line string) (appModel, tea.Cmd) {
 				Model:         model,
 				Agent:         agent,
 				Think:         think,
+				PermissionMode: strings.ToLower(strings.TrimSpace(m.permissionMode)),
 			})
-			m.systemAlert(alertInfo, "opencode.run.turn", "Submitted to OpenCode", map[string]any{"cwd": cwd, "model": model, "agent": agent, "think": think, "runtime": "opencode-run", "compatibility": compatLabel})
+			m.systemAlert(alertInfo, "opencode.run.turn", "Submitted to OpenCode", map[string]any{"cwd": cwd, "model": model, "agent": agent, "think": think, "permissionMode": m.permissionMode, "runtime": "opencode-run", "compatibility": compatLabel})
 			return m, nil
 		}
 		m.systemAlert(alertError, "opencode.run.unavailable", "OpenCode executor not ready", map[string]any{"hint": "Install `opencode` and restart workbench, or switch runtime"})
@@ -1529,6 +1968,10 @@ func (m appModel) updateQuickActions(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		item := quickActionItems()[m.quickActionsIndex]
 		switch item {
+		case "New Session (clear context)":
+			m = m.startNewSession()
+			m = m.closeOverlay()
+			return m, nil
 		case "Switch Provider":
 			m = m.closeOverlay()
 			m = m.openOverlay(overlayProviderSelect)
@@ -1827,46 +2270,18 @@ func (m appModel) viewCockpit() string {
 	header := renderHeader(m.th, m.cfg.applicationV, m.mcpConnected, m.sessionID)
 
 	w, h := m.effectiveSize()
-	// Cockpit uses a 2-panel layout; on narrow terminals, stack vertically to avoid wrap jitter.
 	if w < 35 || h < 10 {
 		return m.viewTooSmall(w, h)
 	}
 
-	if w < 70 {
-		left := m.viewChatLeft(w)
-		right := m.viewStatusRight(w)
-		base := lipgloss.JoinVertical(lipgloss.Top, header, left, "", right)
-		switch m.currentOverlay() {
-		case overlayCommandPalette:
-			return renderOverlay(m.th, base, m.viewCommandPalette())
-		case overlayModelSelect:
-			return renderOverlay(m.th, base, m.viewModelSelect())
-		case overlayQuickActions:
-			return renderOverlay(m.th, base, m.viewQuickActions())
-		case overlayQuitConfirm:
-			return renderOverlay(m.th, base, m.viewQuitConfirm())
-		case overlayAuthSelect:
-			return renderOverlay(m.th, base, m.viewAuthSelect())
-		case overlayStats:
-			return renderOverlay(m.th, base, m.viewStats())
-		case overlaySystemInfo:
-			return renderOverlay(m.th, base, m.viewSystemInfo())
-		case overlayProviderSelect:
-			return renderOverlay(m.th, base, m.viewProviderSelect())
-		case overlayRuntimeSelect:
-			return renderOverlay(m.th, base, m.viewRuntimeSelect())
-		}
-		return base
+	// Single-panel layout: full width for chat, status delegated to tmux pane
+	statusBar := m.viewStatusBar(w)
+	chatHeight := h - lipgloss.Height(header) - lipgloss.Height(statusBar)
+	if chatHeight < 6 {
+		chatHeight = 6
 	}
-
-	leftW := clamp(int(float64(w)*0.70), 24, w-24-1)
-	rightW := max(24, w-leftW-1)
-
-	left := m.viewChatLeft(leftW)
-	right := m.viewStatusRight(rightW)
-
-	row := lipgloss.JoinHorizontal(lipgloss.Top, left, m.th.Muted.Render("│"), right)
-	base := lipgloss.JoinVertical(lipgloss.Top, header, row)
+	chat := m.viewChatFull(w, chatHeight)
+	base := lipgloss.JoinVertical(lipgloss.Top, header, statusBar, chat)
 
 	switch m.currentOverlay() {
 	case overlayCommandPalette:
@@ -1891,39 +2306,215 @@ func (m appModel) viewCockpit() string {
 	return base
 }
 
-func (m appModel) viewChatLeft(width int) string {
-	lines := []string{}
+func (m appModel) viewStatusBar(width int) string {
+	// Compact status bar showing essential info
+	execStatus := "✗"
+	if m.selectedRuntime == "codex-cli" {
+		if m.codexExecutorReady || isCodexExecutorReady(m.cfg.stateDir, m.sessionID, m.now) {
+			execStatus = "✓"
+		}
+	} else if m.selectedRuntime == "opencode-run" {
+		if m.opencodeExecutorReady || isOpencodeExecutorReady(m.cfg.stateDir, m.sessionID, m.now) {
+			execStatus = "✓"
+		}
+	} else if m.selectedRuntime == "codex-chat" {
+		execStatus = "✓" // Chat mode doesn't need executor
+	} else {
+		execStatus = "–"
+	}
+
+	compat := m.currentCompatibility()
+	compatStr := "native"
+	if compat == compatProxy {
+		compatStr = "proxy"
+	}
+
+	parts := []string{
+		fmt.Sprintf("Mode:%s", m.mode.String()),
+		fmt.Sprintf("Runtime:%s", m.selectedRuntimeLabel()),
+		fmt.Sprintf("Model:%s", m.selectedModel),
+		fmt.Sprintf("Perm:%s", strings.Split(m.permissionModeLabel(), " ")[0]),
+		fmt.Sprintf("Exec:%s", execStatus),
+		fmt.Sprintf("Compat:%s", compatStr),
+	}
+	if m.lastOAuthProfile != "" {
+		parts = append(parts, fmt.Sprintf("OAuth:%s", m.lastOAuthProfile))
+	}
+
+	line := strings.Join(parts, " │ ")
+	return m.th.Muted.Width(width).Render(line)
+}
+
+func (m appModel) shouldShowSystemOverlay() bool {
+	// Env override:
+	// - WORKBENCH_TUI_SYSTEM_OVERLAY=0 => never show
+	// - WORKBENCH_TUI_SYSTEM_OVERLAY=1 => always show
+	ov := strings.ToLower(strings.TrimSpace(os.Getenv("WORKBENCH_TUI_SYSTEM_OVERLAY")))
+	if ov == "0" || ov == "false" || ov == "off" || ov == "no" {
+		return false
+	}
+	if ov == "1" || ov == "true" || ov == "on" || ov == "yes" {
+		return true
+	}
+
+	// Default behavior: if we're in tmux, avoid stealing focus from the main pane.
+	// Users can force it on with WORKBENCH_TUI_SYSTEM_OVERLAY=1.
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("WORKBENCH_TMUX_HAS_STATUS_PANE")), "1") {
+		return false
+	}
+	if strings.TrimSpace(os.Getenv("TMUX")) != "" {
+		return false
+	}
+	return true
+}
+
+func (m appModel) chatStreamDisplayText() string {
+	s := strings.TrimRight(m.chatStreamText, "\n")
+	if strings.TrimSpace(s) == "" {
+		return ""
+	}
+	// Keep stream text intact (including newlines) so it can be scrolled and inspected.
+	return s
+}
+
+func (m appModel) chatHistoryLinesWrapped(innerWidth int) []string {
+	out := make([]string, 0, len(m.chatRoleLines)*4)
 	for _, e := range m.chatRoleLines {
+		text := styleChatContent(m.th, e.Text)
 		switch e.Role {
 		case "user":
-			lines = append(lines, m.th.Accent.Render("You: ")+e.Text)
+			out = append(out, wrapChatBlock(m.th.Accent.Render("You: "), "     ", text, innerWidth)...)
 		case "assistant":
-			lines = append(lines, m.th.Success.Render("AI: ")+e.Text)
+			out = append(out, wrapChatBlock(m.th.Success.Render("AI: "), "    ", text, innerWidth)...)
 		default:
-			lines = append(lines, m.th.Muted.Render("[SYSTEM] ")+e.Text)
+			out = append(out, wrapChatBlock(m.th.Muted.Render("[SYSTEM] "), "         ", text, innerWidth)...)
 		}
 	}
 	if m.chatInFlight {
-		if strings.TrimSpace(m.chatStreamText) != "" {
-			stream := strings.ReplaceAll(m.chatStreamText, "\n", " ")
-			stream = strings.TrimSpace(stream)
-			if len(stream) > 240 {
-				stream = stream[len(stream)-240:]
-			}
-			lines = append(lines, m.th.Success.Render("AI: ")+stream)
+		if stream := m.chatStreamDisplayText(); strings.TrimSpace(stream) != "" {
+			stream = styleChatContent(m.th, stream)
+			out = append(out, wrapChatBlock(m.th.Success.Render("AI: "), "    ", stream, innerWidth)...)
 		}
-		lines = append(lines, m.th.Muted.Render("AI is working "+spinner(m.now)))
+		out = append(out, wrapChatBlock(m.th.Muted.Render("[SYSTEM] "), "         ", "AI is working "+spinner(m.now), innerWidth)...)
 	}
-	if len(lines) > 14 {
-		lines = lines[len(lines)-14:]
+	return out
+}
+
+func (m appModel) chatHistoryMaxLines(chatHeight int) int {
+	// Panel border consumes 2 rows (top+bottom). Padding is 0 vertically.
+	innerHeight := chatHeight - 2
+	if innerHeight < 1 {
+		innerHeight = 1
 	}
-	history := strings.Join(lines, "\n")
 
-	inputLine := "> " + m.th.Input.Render(m.input)
+	// Footer/input section:
+	// - 1 blank line
+	// - input line
+	// - info line (permission + view)
+	// - up to 3 alert lines
+	// - footer line
+	alertCount := 0
+	if len(m.alerts) > 0 {
+		alertCount = 3
+		if len(m.alerts) < alertCount {
+			alertCount = len(m.alerts)
+		}
+	}
+	fixed := 1 + 1 + 1 + alertCount + 1
+	max := innerHeight - fixed
+	if max < 1 {
+		max = 1
+	}
+	return max
+}
 
-	footer := m.th.Muted.Render("[Enter] Quick Menu    [/] Cmd Palette")
-	panel := m.th.Panel.Width(width - 2).Render(history + "\n\n" + inputLine + "\n" + footer)
-	return panel
+func (m appModel) chatMaxScrollOffset(chatHeight int, innerWidth int) int {
+	historyMax := m.chatHistoryMaxLines(chatHeight)
+	total := len(m.chatHistoryLinesWrapped(innerWidth))
+	if total <= historyMax {
+		return 0
+	}
+	return total - historyMax
+}
+
+func (m appModel) chatViewLabel(chatHeight int, innerWidth int) string {
+	maxOff := m.chatMaxScrollOffset(chatHeight, innerWidth)
+	off := m.chatScrollOffset
+	if off < 0 {
+		off = 0
+	}
+	if off > maxOff {
+		off = maxOff
+	}
+	if off == 0 {
+		return "Follow"
+	}
+	return fmt.Sprintf("Scrollback (%d/%d)", off, maxOff)
+}
+
+func (m appModel) viewChatFull(width int, chatHeight int) string {
+	innerW := chatInnerWidth(width)
+	historyLines := m.chatHistoryLinesWrapped(innerW)
+	historyMax := m.chatHistoryMaxLines(chatHeight)
+	maxOff := m.chatMaxScrollOffset(chatHeight, innerW)
+
+	off := m.chatScrollOffset
+	if off < 0 {
+		off = 0
+	}
+	if off > maxOff {
+		off = maxOff
+	}
+
+	start := 0
+	if len(historyLines) > historyMax {
+		start = len(historyLines) - historyMax - off
+		if start < 0 {
+			start = 0
+		}
+	}
+	end := start + historyMax
+	if end > len(historyLines) {
+		end = len(historyLines)
+	}
+	visible := historyLines
+	if len(historyLines) > historyMax {
+		visible = historyLines[start:end]
+	}
+	history := strings.Join(visible, "\n")
+
+	clip := lipgloss.NewStyle().MaxWidth(innerW).Render
+
+	inputLine := clip("> " + m.th.Input.Render(m.input))
+	infoLine := clip(m.th.Muted.Render("Permission: " + m.permissionModeLabel() + "  (Shift+Tab)  │  View: " + m.chatViewLabel(chatHeight, innerW) + "  (PgUp/PgDn)"))
+
+	// Show recent alerts inline
+	alertLines := []string{}
+	recent := m.alerts
+	if len(recent) > 3 {
+		recent = recent[len(recent)-3:]
+	}
+	for _, a := range recent {
+		prefix := "[info]"
+		style := m.th.Muted
+		switch a.Severity {
+		case alertCritical, alertError:
+			prefix = "[err]"
+			style = m.th.Danger
+		case alertWarn:
+			prefix = "[warn]"
+			style = m.th.Alert
+		}
+		alertLines = append(alertLines, clip(style.Render(prefix+" "+a.Message)))
+	}
+	alertSection := ""
+	if len(alertLines) > 0 {
+		alertSection = "\n" + strings.Join(alertLines, "\n")
+	}
+
+	footer := clip(m.th.Muted.Render("[Enter] Quick Menu    [/] Cmd Palette    [//] System Cmd    [End] Follow"))
+	panelStyle := m.th.Panel.Width(width - 2).Height(chatHeight)
+	return panelStyle.Render(history + "\n\n" + inputLine + "\n" + infoLine + alertSection + "\n" + footer)
 }
 
 func spinner(now time.Time) string {
@@ -1964,80 +2555,6 @@ func extractCwdFromPrompt(text string) string {
 		}
 	}
 	return ""
-}
-
-func (m appModel) viewStatusRight(width int) string {
-	oauthBorder := lipgloss.Color("#7D7D7D")
-	if !m.oauthFlashUntil.IsZero() && time.Now().Before(m.oauthFlashUntil) {
-		oauthBorder = lipgloss.Color("#FFBF00")
-	}
-
-	oauthBox := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(oauthBorder).
-		Padding(0, 1).
-		Width(width - 2)
-
-	compat := m.currentCompatibility()
-	compatStr := "✓"
-	if compat == compatProxy {
-		compatStr = "⚠ proxy"
-	}
-
-	status := []string{
-		m.th.Accent.Render("STATUS"),
-		fmt.Sprintf("Mode:     %s", m.mode.String()),
-		fmt.Sprintf("Provider: %s", m.selectedProviderLabel()),
-		fmt.Sprintf("Runtime:  %s", m.selectedRuntimeLabel()),
-		fmt.Sprintf("Compat:   %s", compatStr),
-		fmt.Sprintf("Model:    %s", m.selectedModel),
-		fmt.Sprintf("OAuth:    %s", nonEmpty(m.lastOAuthProfile, "unknown")),
-		fmt.Sprintf("MCP:      %d connected", m.mcpConnected),
-		"",
-		m.th.Muted.Render("[ OAUTH POOL (Codex) ]"),
-	}
-
-	if len(m.oauthPool.Profiles) == 0 {
-		status = append(status,
-			"● (unknown) (Active)",
-			renderProgress(m.th, 0.82, 10),
-			"○ (unknown) (Standby)",
-			renderProgress(m.th, 0.21, 10),
-			"‼ (unknown) (Limited)",
-			renderProgress(m.th, 1.00, 10),
-		)
-	} else {
-		ordered := orderOAuthProfilesForDisplay(m.oauthPool.Profiles)
-		maxShow := 3
-		if len(ordered) < maxShow {
-			maxShow = len(ordered)
-		}
-		for i := 0; i < maxShow; i++ {
-			status = append(status, renderOAuthProfileBlockWithUsage(m.th, ordered[i], m.usageByProfile[ordered[i].Profile], m.now)...)
-		}
-	}
-
-	status = append(status, "", m.th.Muted.Render("[ ALERTS ]"))
-
-	recent := m.alerts
-	if len(recent) > 6 {
-		recent = recent[len(recent)-6:]
-	}
-	for _, a := range recent {
-		line := fmt.Sprintf("[%s] %s", a.Severity, a.Message)
-		switch a.Severity {
-		case alertCritical:
-			status = append(status, m.th.Danger.Render(line))
-		case alertError:
-			status = append(status, m.th.Danger.Render(line))
-		case alertWarn:
-			status = append(status, m.th.Alert.Render(line))
-		default:
-			status = append(status, m.th.Muted.Render(line))
-		}
-	}
-
-	return oauthBox.Render(strings.Join(status, "\n"))
 }
 
 func (m appModel) viewCommandPalette() string {
@@ -2285,6 +2802,7 @@ func systemCommandPaletteItems() []paletteItem {
 		{cmd: "model", desc: "Switch AI Model", label: "Switch AI Model", action: "model"},
 		{cmd: "auth", desc: "Manage OAuth Accounts", label: "Manage OAuth Accounts", action: "auth"},
 		{cmd: "mode", desc: "Switch Session Mode (A <-> B)", label: "Switch Session Mode", action: "mode"},
+		{cmd: "session", desc: "Start a new session (clears context + cancels stuck turns)", label: "New Session", action: "session"},
 		{cmd: "stats", desc: "View Detailed Statistics", label: "View Detailed Statistics", action: "stats"},
 		{cmd: "docker", desc: "Docker status/probe", label: "Docker status/probe", action: "docker"},
 		{cmd: "verify", desc: "Run verification gates", label: "Run verification gates", action: "verify"},
@@ -2336,7 +2854,7 @@ func filteredCommandPaletteItems(namespace string, query string) []paletteItem {
 }
 
 func quickActionItems() []string {
-	return []string{"Switch Provider", "Switch Runtime", "Change Mode", "Toggle Thought Stream", "Snapshot Evidence"}
+	return []string{"New Session (clear context)", "Switch Provider", "Switch Runtime", "Change Mode", "Toggle Thought Stream", "Snapshot Evidence"}
 }
 
 // Provider selection - LLM vendor

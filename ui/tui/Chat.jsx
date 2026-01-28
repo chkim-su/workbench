@@ -11,6 +11,7 @@ import TracesPanel from './components/TracesPanel.jsx';
 import StatusPane from './StatusPane.jsx';
 import { useTraceWatcher } from './hooks/useTraceWatcher.js';
 import { appendSystemRequest, getClaudeConnectionMode, isSystemExecutorReady, newCorrelationId, readSystemResponses, setClaudeConnectionMode } from './system-client.js';
+import { getPermissionModeConfig, getPermissionModeList, DEFAULT_PERMISSION_MODE } from './permissionModes.js';
 
 // ─── Constants ───
 
@@ -37,6 +38,7 @@ const SYSTEM_COMMANDS = {
   '//help': 'Show available commands',
   '//provider': 'Switch provider (OpenAI Codex, Claude Code)',
   '//runtime': 'Select runtime mode (Codex Chat, Codex CLI, OpenCode, Claude Code)',
+  '//permission': 'Change Codex permission mode (plan/bypass)',
   '//model': 'Change the model',
   '//models': 'List available models',
   '//profile': 'Switch OAuth profile (Codex only)',
@@ -151,6 +153,140 @@ function launchClaudeCodeInPane() {
       success: false,
       message: `Failed to focus tmux UI pane for Claude Code: ${e.message}`,
     };
+  }
+}
+
+/**
+ * Ensure Docker pane exists as a bottom split in the control window.
+ * The pane displays Docker process streaming (stdout/stderr from containers).
+ */
+function ensureDockerPane() {
+  const session = process.env.WORKBENCH_TMUX_SESSION || 'workbench';
+  // Default to 'workbench' server - this matches scripts/tmux_start.sh
+  const server = process.env.WORKBENCH_TMUX_SERVER || 'workbench';
+  const tmuxBin = `tmux -L "${server}"`;
+  const stateDir = process.env.WORKBENCH_STATE_DIR || join(process.cwd(), '.workbench');
+  const repoRoot = process.env.WORKBENCH_REPO_ROOT || process.cwd();
+
+  // Check if tmux is available
+  try {
+    execSync('command -v tmux >/dev/null 2>&1');
+  } catch {
+    return { success: false, reason: 'no_tmux', message: 'tmux not installed. Run `workbench` to start with tmux.' };
+  }
+
+  // Check if session exists on our server
+  try {
+    execSync(`${tmuxBin} has-session -t "${session}" 2>/dev/null`);
+  } catch {
+    return { success: false, reason: 'no_session', message: `tmux session "${session}" not found on server "${server}". Run \`workbench\` to start.` };
+  }
+
+  // Check if Docker pane already exists by looking for pane with title "docker"
+  const listPanes = () => {
+    const out = execSync(
+      `${tmuxBin} list-panes -t "${session}:control" -F "#{pane_index}|#{pane_title}|#{@workbench_pane_role}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}|#{pane_current_command}"`,
+      { stdio: ['ignore', 'pipe', 'ignore'] }
+    ).toString();
+    return out
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const [idx, title, role, left, top, width, height, currentCommand] = line.split('|');
+        return {
+          idx: Number(idx),
+          title: (title || '').trim(),
+          role: (role || '').trim(),
+          left: Number(left),
+          top: Number(top),
+          width: Number(width),
+          height: Number(height),
+          currentCommand: (currentCommand || '').trim(),
+        };
+      })
+      .filter(p => Number.isFinite(p.idx));
+  };
+
+  let panes = [];
+  try {
+    panes = listPanes();
+    if (panes.some(p => p.role === 'docker' || p.title === 'docker')) {
+      return { success: true, created: false, message: 'Docker pane already exists' };
+    }
+  } catch {
+    panes = [];
+  }
+
+  const dockerScript = join(repoRoot, 'ui/tui/docker-pane.js');
+  const dockerCmd = `WORKBENCH_STATE_DIR="${stateDir}" WORKBENCH_REPO_ROOT="${repoRoot}" WORKBENCH_TMUX_SERVER="${server}" WORKBENCH_TMUX_SESSION="${session}" bun "${dockerScript}"`;
+  const escapedDockerCmd = dockerCmd.replace(/"/g, '\\"');
+
+  const statusCmd = `WORKBENCH_TMUX_SERVER="${server}" WORKBENCH_TMUX_SESSION="${session}" WORKBENCH_STATE_DIR="${stateDir}" bun "${join(repoRoot, 'ui/tui/status-pane-entry.jsx')}"`;
+  const escapedStatusCmd = statusCmd.replace(/"/g, '\\"');
+
+  const isShell = (cmd) => ['bash', 'sh', 'zsh', 'fish'].includes((cmd || '').trim());
+
+  try {
+    // If we have a conflicting 2-pane layout (TUI + full-height status), rebuild to expected 3-pane layout
+    if (panes.length === 2) {
+      const status = panes.find(p => p.role === 'status' || p.title === 'status');
+      const rightMost = panes.reduce((best, p) => (p.left > best.left ? p : best), panes[0]);
+      const toKill = status || rightMost;
+      try { execSync(`${tmuxBin} kill-pane -t "${session}:control.${toKill.idx}"`, { stdio: 'ignore' }); } catch {}
+      panes = listPanes();
+    }
+
+    // If we already have 3+ panes, try to (re)use the bottom-most shell pane for docker streaming.
+    if (panes.length >= 3) {
+      const candidates = panes
+        .filter(p => p.role !== 'status' && p.title !== 'status' && p.idx !== 0)
+        .sort((a, b) => (b.top - a.top) || (a.left - b.left));
+      const bottom = candidates[0];
+      if (!bottom) {
+        return { success: false, reason: 'no_target', message: 'Could not find a suitable tmux pane for Docker output.' };
+      }
+      if (!isShell(bottom.currentCommand)) {
+        return {
+          success: false,
+          reason: 'unsafe_target',
+          message: `Refusing to overwrite non-shell pane (control.${bottom.idx} running "${bottom.currentCommand}"). Restart \`workbench\` to rebuild panes.`,
+        };
+      }
+      execSync(`${tmuxBin} set-option -pt "${session}:control.${bottom.idx}" @workbench_pane_role docker 2>/dev/null || true`);
+      execSync(`${tmuxBin} select-pane -t "${session}:control.${bottom.idx}" -T docker 2>/dev/null || true`);
+      execSync(`${tmuxBin} send-keys -t "${session}:control.${bottom.idx}" C-c`, { stdio: 'ignore' });
+      execSync(`${tmuxBin} send-keys -t "${session}:control.${bottom.idx}" "clear && ${escapedDockerCmd}" Enter`, { stdio: 'ignore' });
+      try { execSync(`${tmuxBin} select-pane -t "${session}:control.0"`, { stdio: 'ignore' }); } catch {}
+      return { success: true, created: true, message: 'Docker pane started' };
+    }
+
+    // Otherwise, create the expected layout in the control window:
+    // 1) bottom docker pane (full width), then 2) top-right status pane.
+    const dockerIdx = execSync(
+      `${tmuxBin} split-window -t "${session}:control.0" -v -l 30% -c "${repoRoot}" -P -F "#{pane_index}" "${escapedDockerCmd}"`,
+      { stdio: ['ignore', 'pipe', 'ignore'] }
+    ).toString().trim();
+    try { execSync(`${tmuxBin} set-option -pt "${session}:control.${dockerIdx}" @workbench_pane_role docker 2>/dev/null`, { stdio: 'ignore' }); } catch {}
+    try { execSync(`${tmuxBin} select-pane -t "${session}:control.${dockerIdx}" -T docker 2>/dev/null`, { stdio: 'ignore' }); } catch {}
+
+    const statusIdx = execSync(
+      `${tmuxBin} split-window -t "${session}:control.0" -h -c "${repoRoot}" -P -F "#{pane_index}" "${escapedStatusCmd}"`,
+      { stdio: ['ignore', 'pipe', 'ignore'] }
+    ).toString().trim();
+    try { execSync(`${tmuxBin} set-option -pt "${session}:control.${statusIdx}" @workbench_pane_role status 2>/dev/null`, { stdio: 'ignore' }); } catch {}
+    try { execSync(`${tmuxBin} select-pane -t "${session}:control.${statusIdx}" -T status 2>/dev/null`, { stdio: 'ignore' }); } catch {}
+    try { execSync(`${tmuxBin} resize-pane -t "${session}:control.${statusIdx}" -x 50 2>/dev/null`, { stdio: 'ignore' }); } catch {}
+
+    // Return focus to the original pane (main TUI)
+    try { execSync(`${tmuxBin} select-pane -t "${session}:control.0"`, { stdio: 'ignore' }); } catch {}
+    return { success: true, created: true, message: 'Docker pane created' };
+  } catch (e) {
+    const errMsg = e.message || String(e);
+    if (errMsg.includes('no such window')) {
+      return { success: false, reason: 'no_control_window', message: 'tmux window "control" not found. Run `workbench` to start properly.' };
+    }
+    return { success: false, reason: 'create_failed', message: `Failed to create Docker pane: ${errMsg}` };
   }
 }
 
@@ -328,9 +464,10 @@ function emitTraceEvent(eventsPath, correlationId, { kind, message, tool }) {
   }
 }
 
-async function runCodexRuntimeTurn({ stateDir, model, profileName, prompt, cwd, eventsPath, correlationId }) {
+async function runCodexRuntimeTurn({ stateDir, model, profileName, prompt, cwd, eventsPath, correlationId, permissionMode }) {
   const { codexHomeDir } = writeCodexAuthFromPool({ stateDir, profileName });
-  const args = ['exec', '--json', '--sandbox', 'workspace-write', '--skip-git-repo-check', '--cd', cwd];
+  const permConfig = getPermissionModeConfig(permissionMode || DEFAULT_PERMISSION_MODE);
+  const args = ['exec', '--json', '--sandbox', permConfig.sandboxFlag, '--skip-git-repo-check', '--cd', cwd];
   if (model) args.push('--model', model);
 
   const preludeLines = [
@@ -339,6 +476,9 @@ async function runCodexRuntimeTurn({ stateDir, model, profileName, prompt, cwd, 
     'Prefer apply_patch-style edits when modifying files.',
     'Do not claim you cannot create files.',
   ];
+  if (permConfig.noShell) {
+    preludeLines.push('Do not run shell commands.');
+  }
   const fullPrompt = `${preludeLines.join('\n')}\n\nUSER:\n${prompt}`;
   args.push(fullPrompt);
 
@@ -514,12 +654,44 @@ async function runOpenCodeRuntimeTurn({ stateDir, model, agent, prompt, cwd, onE
 // ─── Components ───
 
 const MESSAGE_STYLES = {
-  user: { headerColor: 'cyan', label: 'You', textColor: undefined },
-  system: { headerColor: 'yellow', label: 'System', textColor: undefined },
-  error: { headerColor: 'red', label: 'Error', textColor: 'red' },
-  command: { headerColor: 'magenta', label: 'Command', textColor: 'magenta' },
-  assistant: { headerColor: 'green', label: 'Assistant', textColor: undefined },
+  user: { headerColor: 'cyan', label: 'You', textColor: undefined, borderColor: 'cyan', borderStyle: 'single', showBorder: true },
+  system: { headerColor: 'yellow', label: 'System', textColor: undefined, showBorder: false },
+  error: { headerColor: 'red', label: 'Error', textColor: 'red', borderColor: 'red', borderStyle: 'double', showBorder: true },
+  command: { headerColor: 'magenta', label: 'Command', textColor: 'magenta', showBorder: false },
+  assistant: { headerColor: 'green', label: 'Assistant', textColor: undefined, borderColor: 'green', borderStyle: 'round', showBorder: true },
 };
+
+/**
+ * Parse content for markdown code blocks (``` fenced blocks)
+ * Returns array of segments: { isCode: boolean, text: string, lang?: string }
+ */
+function parseCodeBlocks(content) {
+  if (!content || typeof content !== 'string') return [{ isCode: false, text: content || '' }];
+
+  const segments = [];
+  const codeBlockRegex = /```(\w*)\n?([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = codeBlockRegex.exec(content)) !== null) {
+    // Text before code block
+    if (match.index > lastIndex) {
+      const text = content.slice(lastIndex, match.index).trim();
+      if (text) segments.push({ isCode: false, text });
+    }
+    // Code block
+    segments.push({ isCode: true, text: match[2].trim(), lang: match[1] || null });
+    lastIndex = match.index + match[0].length;
+  }
+
+  // Remaining text after last code block
+  if (lastIndex < content.length) {
+    const text = content.slice(lastIndex).trim();
+    if (text) segments.push({ isCode: false, text });
+  }
+
+  return segments.length > 0 ? segments : [{ isCode: false, text: content }];
+}
 
 function looksLikeFileOpRequest(text) {
   const t = String(text || '').toLowerCase();
@@ -535,14 +707,29 @@ function looksLikeFileOpRequest(text) {
 // Memoized to prevent re-renders when parent state changes (reduces flicker)
 const Message = memo(function Message({ role, content }) {
   const style = MESSAGE_STYLES[role] || MESSAGE_STYLES.assistant;
+  const segments = parseCodeBlocks(content);
 
-  return (
-    <Box flexDirection="column" marginBottom={1}>
+  const inner = (
+    <Box flexDirection="column">
       <Text bold color={style.headerColor}>{style.label}:</Text>
-      <Box paddingLeft={2}>
-        <Text wrap="wrap" color={style.textColor}>{content}</Text>
+      <Box paddingLeft={2} flexDirection="column">
+        {segments.map((seg, i) => seg.isCode ? (
+          <Box key={i} borderStyle="single" borderColor="gray" paddingX={1} marginY={1}>
+            <Text>{seg.text}</Text>
+          </Box>
+        ) : (
+          <Text key={i} wrap="wrap" color={style.textColor}>{seg.text}</Text>
+        ))}
       </Box>
     </Box>
+  );
+
+  return style.showBorder ? (
+    <Box marginBottom={2} borderStyle={style.borderStyle} borderColor={style.borderColor} paddingX={1}>
+      {inner}
+    </Box>
+  ) : (
+    <Box flexDirection="column" marginBottom={1}>{inner}</Box>
   );
 });
 
@@ -744,9 +931,11 @@ function StatusView({ oauthPool, currentProfile, currentModel, onClose }) {
 export default function Chat({
   provider = 'openai-oauth',
   sessionMode,
+  permissionMode: permissionModeProp,
   sessionManager,
   onClose,
   onModeChange,
+  onPermissionModeChange,
 }) {
   const { stdout } = useStdout();
   // Resize events are already debounced at entry point level (100ms)
@@ -765,8 +954,10 @@ export default function Chat({
   const stateDir = process.env.WORKBENCH_STATE_DIR || join(repoRoot, '.workbench');
 
   const [messages, setMessages] = useState([]);
+  const [scrollOffset, setScrollOffset] = useState(0);  // 0 = at bottom (newest), positive = scrolled up
   const [isLoading, setIsLoading] = useState(false);
-  const [viewMode, setViewMode] = useState('chat'); // chat | help | model | profile | status | provider | runtime
+  const [viewMode, setViewMode] = useState('chat'); // chat | help | model | profile | status | provider | runtime | permission
+  const [currentPermissionMode, setCurrentPermissionMode] = useState(permissionModeProp || DEFAULT_PERMISSION_MODE);
   const [currentModel, setCurrentModel] = useState('gpt-5-codex-mini');
   const [currentProfile, setCurrentProfile] = useState(null);
   const [currentProvider, setCurrentProvider] = useState(provider);
@@ -777,11 +968,16 @@ export default function Chat({
   const [opencodeAvailable, setOpencodeAvailable] = useState(false);
   const [oauthPool, setOauthPool] = useState(null);
   // Prefer a tmux-hosted status pane. Allow forcing embedded status for non-tmux use.
+  const externalStatusPane = process.env.WORKBENCH_TMUX_HAS_STATUS_PANE === '1';
   const [showSidebar, setShowSidebar] = useState(() => {
     if (process.env.WORKBENCH_EMBED_STATUS === '1') return true;
     if (process.env.WORKBENCH_EMBED_STATUS === '0') return false;
+    if (externalStatusPane) return false;
     return !process.env.TMUX;
   });
+  useEffect(() => {
+    if (externalStatusPane && showSidebar) setShowSidebar(false);
+  }, [externalStatusPane, showSidebar]);
 
   // Compose/input state (kept together to avoid multi-render flicker on each keystroke)
   const [composer, setComposer] = useState({
@@ -1006,6 +1202,29 @@ export default function Chat({
       return;
     }
 
+    // Scroll navigation (PageUp, PageDown, Ctrl+U, Ctrl+D, End)
+    if (!composer.input) {
+      const scrollAmount = 5; // Number of messages to scroll
+
+      // PageUp or Ctrl+U: scroll up (view older messages)
+      if (key.pageUp || (key.ctrl && inputChar === 'u')) {
+        setScrollOffset((prev) => Math.min(prev + scrollAmount, Math.max(0, messages.length - 1)));
+        return;
+      }
+
+      // PageDown or Ctrl+D: scroll down (view newer messages)
+      if (key.pageDown || (key.ctrl && inputChar === 'd')) {
+        setScrollOffset((prev) => Math.max(0, prev - scrollAmount));
+        return;
+      }
+
+      // End: jump to newest (reset scroll)
+      if (key.end) {
+        setScrollOffset(0);
+        return;
+      }
+    }
+
     // Toggle traces panel with 't' key (only when not typing in input)
     if (inputChar === 't' && !composer.input && traces.length > 0 && !isLoading) {
       setTracesCollapsed((prev) => !prev);
@@ -1086,11 +1305,20 @@ export default function Chat({
     switch (command) {
 
       case '//docker':
-        requestSystemAction({
-          type: 'docker.probe',
-          description: 'Docker probe (gate 4)',
-          logMessage: 'Requesting Docker probe via //docker...',
-        });
+        {
+          // Ensure Docker pane exists first
+          const paneResult = ensureDockerPane();
+          if (paneResult.success) {
+            // Queue Docker probe - results will appear ONLY in the Docker pane
+            const correlationId = newCorrelationId();
+            appendSystemRequest(stateDir, { type: 'docker.probe', correlationId });
+            pushSystemMessage(paneResult.created
+              ? 'Docker pane opened. Results will appear in the bottom pane.'
+              : 'Docker pane active. Probing Docker...');
+          } else {
+            pushSystemMessage(paneResult.message || 'Could not create Docker pane.');
+          }
+        }
         return true;
 
       case '//verify':
@@ -1125,6 +1353,15 @@ export default function Chat({
 
       case '//sidebar':
         {
+          if (externalStatusPane) {
+            setShowSidebar(false);
+            setMessages((prev) => [...prev, {
+              id: nextMsgId(),
+              role: 'command',
+              content: 'Status sidebar is disabled when a tmux status pane is present (use the right-side Status pane).',
+            }]);
+            return true;
+          }
           const next = !showSidebar;
           setShowSidebar(next);
           setMessages((prev) => [...prev, { id: nextMsgId(), role: 'command', content: `Status sidebar: ${next ? 'on' : 'off'}` }]);
@@ -1149,6 +1386,10 @@ export default function Chat({
 
       case '//runtime':
         setViewMode('runtime');
+        return true;
+
+      case '//permission':
+        setViewMode('permission');
         return true;
 
       case '//pwd':
@@ -1266,6 +1507,9 @@ export default function Chat({
   const handleSubmit = async (value) => {
     if (!value.trim() || isLoading) return;
 
+    // Reset scroll to bottom when user sends a message
+    setScrollOffset(0);
+
     // Check for slash commands first
     if (handleSlashCommand(value.trim())) {
       return;
@@ -1340,6 +1584,7 @@ export default function Chat({
           cwd,
           eventsPath: eventsFilePath,
           correlationId,
+          permissionMode: currentPermissionMode,
         });
         setMessages((prev) => [...prev, { id: nextMsgId(), role: 'assistant', content: r.text }]);
         if (r.fileChanges?.length) {
@@ -1536,6 +1781,42 @@ except Exception as e:
     setViewMode('chat');
   }, [claudeConnectionMode, codexAvailable]);
 
+const PermissionSelector = memo(function PermissionSelector({ currentPermissionMode, onSelect, onCancel }) {
+  useInput((input, key) => {
+    if (key.escape) onCancel();
+  });
+
+  const modes = getPermissionModeList();
+  const options = modes.map((m) => {
+    const isCurrent = m.key === currentPermissionMode;
+    const riskIndicator = m.riskLevel === 'high' ? ' [CAUTION]' : m.riskLevel === 'medium' ? ' [MODERATE]' : ' [SAFE]';
+    return {
+      label: `${m.label}${riskIndicator}${isCurrent ? ' *' : ''}`,
+      value: m.key,
+    };
+  });
+
+  return (
+    <Box flexDirection="column" padding={1}>
+      <Box borderStyle="round" borderColor="cyan" paddingX={2} paddingY={1} marginBottom={1}>
+        <Text bold color="cyan">Select Permission Mode</Text>
+      </Box>
+      <Box paddingX={2}>
+        <Menu options={options} onSelect={onSelect} showHint={false} />
+      </Box>
+      <Box marginTop={1} paddingX={2} flexDirection="column">
+        <Text dimColor>Current: {currentPermissionMode} | Esc to cancel</Text>
+        <Text dimColor>Controls Codex sandbox and shell access</Text>
+      </Box>
+      {currentPermissionMode === 'bypass' && (
+        <Box marginTop={1} paddingX={2}>
+          <Text color="red">Warning: bypass mode grants full filesystem access</Text>
+        </Box>
+      )}
+    </Box>
+  );
+});
+
 const RuntimeSelector = memo(function RuntimeSelector({ currentRuntime, currentProvider, codexAvailable, opencodeAvailable, claudeAvailable, onSelect, onCancel }) {
   useInput((input, key) => {
     if (key.escape) onCancel();
@@ -1657,6 +1938,19 @@ const RuntimeSelector = memo(function RuntimeSelector({ currentRuntime, currentP
     setViewMode('chat');
   }, [currentProvider, stateDir, codexAvailable, opencodeAvailable, claudeAvailable]);
 
+  // Handle permission mode selection
+  const handlePermissionSelect = useCallback((mode) => {
+    const config = getPermissionModeConfig(mode);
+    setCurrentPermissionMode(mode);
+    onPermissionModeChange?.(mode);
+    setMessages((prev) => [...prev, {
+      id: nextMsgId(),
+      role: 'command',
+      content: `Permission mode changed to: ${config.label} (sandbox: ${config.sandboxFlag}, shell: ${config.noShell ? 'disabled' : 'allowed'})`,
+    }]);
+    setViewMode('chat');
+  }, [onPermissionModeChange]);
+
   const returnToChat = useCallback(() => {
     setViewMode('chat');
   }, []);
@@ -1719,6 +2013,15 @@ const RuntimeSelector = memo(function RuntimeSelector({ currentRuntime, currentP
         />
       );
 
+    case 'permission':
+      return (
+        <PermissionSelector
+          currentPermissionMode={currentPermissionMode}
+          onSelect={handlePermissionSelect}
+          onCancel={returnToChat}
+        />
+      );
+
     default:
       break;
   }
@@ -1737,16 +2040,19 @@ const RuntimeSelector = memo(function RuntimeSelector({ currentRuntime, currentP
   // Ink clears the entire terminal when rendered output >= terminal height.
   // Keep the rendered chat output comfortably under `rows` to avoid visible flicker,
   // especially while overlays (palette/quick actions) are open.
-  const messagesToRender = (() => {
+  // Uses virtual scrolling with scrollOffset to allow viewing older messages.
+  const { messagesToRender, hiddenAbove, hiddenBelow } = useMemo(() => {
     const sidebarWidth = sidebarEligible && showSidebar ? 42 : 0;
     const approxTextCols = Math.max(24, cols - sidebarWidth - 20);
     // Account for trace panel: collapsed=2 rows, expanded=min(traces+4, 16)
     const tracePanelRows = traces.length > 0
       ? (tracesCollapsed && !isLoading ? 2 : Math.min(traces.length + 4, 16))
       : (isLoading ? 4 : 0);
-    const reservedRows = (composer.showPalette ? 18 : 10) + (isLoading ? 2 : 0) + tracePanelRows;
+    // Account for scroll indicators (2 rows when scrolled)
+    const scrollIndicatorRows = scrollOffset > 0 ? 2 : 0;
+    const reservedRows = (composer.showPalette ? 18 : 10) + (isLoading ? 2 : 0) + tracePanelRows + scrollIndicatorRows;
     const budget = Math.max(0, rows - reservedRows);
-    if (budget <= 0) return [];
+    if (budget <= 0) return { messagesToRender: [], hiddenAbove: 0, hiddenBelow: 0 };
 
     const estimateWrappedLines = (text) => {
       const s = String(text ?? '');
@@ -1754,23 +2060,51 @@ const RuntimeSelector = memo(function RuntimeSelector({ currentRuntime, currentP
       let count = 0;
       for (const line of lines) {
         const len = line.length;
+        // Account for border padding in bordered messages
         count += Math.max(1, Math.ceil(len / approxTextCols));
       }
       return count;
     };
 
+    // Calculate the end index based on scroll offset
+    // scrollOffset=0 means show newest, scrollOffset>0 means show older
+    const endIndex = Math.max(0, messages.length - scrollOffset);
+
     let used = 0;
     const out = [];
-    for (let i = messages.length - 1; i >= 0; i--) {
+    for (let i = endIndex - 1; i >= 0; i--) {
       const m = messages[i];
-      const estimated = 1 /* header */ + estimateWrappedLines(m?.content) + 1 /* margin */;
-      if (out.length > 0 && used+estimated > budget) break;
+      // Bordered messages take more space (estimate +3 for border lines)
+      const style = MESSAGE_STYLES[m?.role] || MESSAGE_STYLES.assistant;
+      const borderExtra = style.showBorder ? 3 : 0;
+      const estimated = 1 /* header */ + estimateWrappedLines(m?.content) + 1 /* margin */ + borderExtra;
+      if (out.length > 0 && used + estimated > budget) break;
       used += estimated;
       out.push(m);
       if (used >= budget) break;
     }
-    return out.reverse();
-  })();
+
+    const rendered = out.reverse();
+    const startIndex = endIndex - rendered.length;
+
+    return {
+      messagesToRender: rendered,
+      hiddenAbove: startIndex,
+      hiddenBelow: scrollOffset,
+    };
+  }, [messages, scrollOffset, sidebarEligible, showSidebar, cols, rows, traces.length, tracesCollapsed, isLoading, composer.showPalette]);
+
+  // Auto-scroll to bottom when new message arrives (if already at bottom)
+  useEffect(() => {
+    if (scrollOffset === 0) return; // Already at bottom, no action needed
+    // If we were scrolled up but now there are new messages, don't auto-scroll
+    // User is reading history - let them stay where they are
+  }, [messages.length]);
+
+  // Reset scroll to bottom when user sends a message
+  const resetScrollOnNewMessage = useCallback(() => {
+    setScrollOffset(0);
+  }, []);
 
   // Main chat view
   return (
@@ -1789,6 +2123,10 @@ const RuntimeSelector = memo(function RuntimeSelector({ currentRuntime, currentP
           </Text>
           <Text dimColor> | </Text>
           <Text color="green">{currentModel}</Text>
+          <Text dimColor> | </Text>
+          <Text color={getPermissionModeConfig(currentPermissionMode).color}>
+            {currentPermissionMode.toUpperCase()}
+          </Text>
           {cols >= 120 && (
             <>
               <Text dimColor> | </Text>
@@ -1801,10 +2139,24 @@ const RuntimeSelector = memo(function RuntimeSelector({ currentRuntime, currentP
         </Box>
 
         {/* Messages area */}
-        <Box flexDirection="column" flexGrow={1} paddingX={1} overflowY="hidden">
+        <Box flexDirection="column" flexGrow={1} paddingX={1}>
+          {/* Scroll indicator: older messages above */}
+          {hiddenAbove > 0 && (
+            <Box marginBottom={1}>
+              <Text dimColor>↑ {hiddenAbove} older message{hiddenAbove !== 1 ? 's' : ''} above (PgUp/Ctrl+U to scroll)</Text>
+            </Box>
+          )}
+
           {messagesToRender.map((msg) => (
             <Message key={msg.id || `${msg.role}:${msg.content?.slice?.(0, 32) || ''}`} role={msg.role} content={msg.content} />
           ))}
+
+          {/* Scroll indicator: newer messages below */}
+          {hiddenBelow > 0 && (
+            <Box marginTop={1}>
+              <Text dimColor>↓ {hiddenBelow} newer message{hiddenBelow !== 1 ? 's' : ''} below (PgDn/Ctrl+D or End to scroll)</Text>
+            </Box>
+          )}
 
           {/* Reasoning traces panel */}
           {(isLoading || traces.length > 0) && (
@@ -1907,9 +2259,9 @@ const RuntimeSelector = memo(function RuntimeSelector({ currentRuntime, currentP
           <Text dimColor>//exit</Text>
           {cols >= 70 && <Text dimColor>/new</Text>}
           {cols >= 80 && <Text dimColor>//mode</Text>}
-          {cols >= 90 && <Text dimColor>//provider</Text>}
-          {cols >= 100 && <Text dimColor>//model</Text>}
-          {cols >= 110 && <Text dimColor>//status</Text>}
+          {cols >= 90 && <Text dimColor>//permission</Text>}
+          {cols >= 100 && <Text dimColor>//provider</Text>}
+          {cols >= 110 && <Text dimColor>//model</Text>}
         </Box>
       </Box>
 

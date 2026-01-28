@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+
+# Workbench state and cache
+.workbench
+.workbench_*
+.serena
+
+# Node modules (will be installed in container)
+node_modules
+*/node_modules
+
+# Bun cache
+.bun
+
+# Test and dev files
+test
+*.test.js
+*.spec.js
+
+# Documentation
+*.md
+!README.md
+
+# Local configs
+.env
+.env.*
+*.local.*
+
+# IDE
+.vscode
+.idea
+
+# Screenshots and images
+*.png
+*.jpg
+*.jpeg
+
+# Build artifacts
+dist
+build

@@ -6,10 +6,10 @@ import { Box, Text } from 'ink';
  * Maps trace kinds to their visual appearance
  */
 const TRACE_STYLES = {
-  think: { color: 'yellow', prefix: '', italic: true, dim: true },
-  tool_use: { color: 'cyan', prefix: '[tool] ', italic: false, dim: false },
+  think: { color: 'yellow', prefix: '[think] ', italic: true, dim: false },  // Removed dim for visibility
+  tool_use: { color: 'cyan', prefix: '[tool] ', italic: false, dim: false, bold: true },
   step_start: { color: 'blue', prefix: '> ', italic: false, dim: false, bold: true },
-  step_finish: { color: 'blue', prefix: '< ', italic: false, dim: true },
+  step_finish: { color: 'green', prefix: '< ', italic: false, dim: true },  // Green for completion
   info: { color: 'gray', prefix: '', italic: false, dim: true },
   error: { color: 'red', prefix: '[error] ', italic: false, dim: false, bold: true },
 };

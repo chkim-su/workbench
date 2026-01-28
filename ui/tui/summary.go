@@ -33,6 +33,8 @@ func writeSessionSummary(m appModel) {
 		"selectedProvider":  m.selectedProvider,
 		"selectedRuntime":   m.selectedRuntime,
 		"selectedModel":     m.selectedModel,
+		"permissionMode":    m.permissionMode,
+		"thoughtStream":     m.thoughtStream,
 		"compatibility":     m.currentCompatibility().String(),
 		"activeOAuthEmail":  m.lastOAuthProfile,
 		"recentAlerts":      alerts,
@@ -46,4 +48,3 @@ func writeSessionSummary(m appModel) {
 	}
 	_ = os.WriteFile(filepath.Join(dir, "summary.json"), append(b, '\n'), 0o644)
 }
-

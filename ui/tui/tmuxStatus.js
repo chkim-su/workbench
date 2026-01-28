@@ -4,13 +4,19 @@ import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 
 const STATUS_FORMAT =
-  '#{session_name}|#{window_name}|#{window_index}|#{pane_index}|#{?pane_active,active,inactive}|#{pane_current_command}|#{pane_title}';
+  '#{session_name}|#{window_name}|#{window_index}|#{pane_index}|#{?pane_active,active,inactive}|#{pane_current_command}|#{pane_title}|#{@workbench_pane_role}';
+
+// Fixed pane slot definitions for Workbench layout
+// These match the expected pane roles set in tmux_start.sh
+const PANE_SLOT_ROLES = ['main', 'docker', 'status', 'command'];
 
 const DEFAULT_STATUS = {
   installed: false,
   sessionExists: false,
   sessions: [],
   panes: [],
+  paneSlots: [null, null, null, null], // Fixed 4 slots for main, docker, status, command
+  emptySlots: [0, 1, 2, 3],
   error: null,
 };
 
@@ -69,7 +75,8 @@ export async function fetchTmuxStatus(sessionName = 'workbench', serverName = 'w
       const paneIndexStr = parts[3] || '';
       const activeLabel = parts[4] || 'inactive';
       const command = parts[5] || '';
-      const title = parts.slice(6).join('|') || '';
+      const title = parts[6] || '';
+      const role = parts[7] || '';
       return {
         sessionName: sessionPart || 'unknown',
         windowName,
@@ -78,7 +85,20 @@ export async function fetchTmuxStatus(sessionName = 'workbench', serverName = 'w
         active: activeLabel === 'active',
         command,
         title,
+        role,
       };
+    });
+
+    // Build pane slots array (null for missing panes)
+    const controlPanes = panes.filter(p => p.windowName === 'control');
+    const paneSlots = PANE_SLOT_ROLES.map((expectedRole, slotIndex) => {
+      const pane = controlPanes.find(p => p.role === expectedRole) ||
+                   controlPanes.find(p => p.paneIndex === slotIndex);
+      if (pane) {
+        return { ...pane, slotIndex, expectedRole, active: true };
+      }
+      // Slot is empty (pane was closed)
+      return null;
     });
 
     const sessions = panes.length ? [sessionName] : [];
@@ -87,6 +107,8 @@ export async function fetchTmuxStatus(sessionName = 'workbench', serverName = 'w
       sessionExists: true,
       sessions,
       panes,
+      paneSlots,
+      emptySlots: paneSlots.map((s, i) => s === null ? i : null).filter(i => i !== null),
       error: null,
     };
   } catch (err) {

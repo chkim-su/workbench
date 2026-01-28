@@ -19,6 +19,7 @@
 #   WORKBENCH_LOG_LEVEL      Default log level
 #   WORKBENCH_HEADLESS       Force headless mode (1=true)
 #   WORKBENCH_JSON           Force JSON output (1=true)
+#   WORKBENCH_GO_TUI_TMUX    Full tmux layout (default: 1); set to 0 for single-window mode
 #
 
 set -euo pipefail
@@ -60,11 +61,17 @@ if [[ ! -f "$STATE_DIR/state/current.json" ]]; then
   echo '{"schemaVersion":1,"updatedAt":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$STATE_DIR/state/current.json"
 fi
 
+# Sync MCP servers to Claude Code and Codex config
+if command -v node >/dev/null 2>&1 && [[ -f "$ROOT/scripts/mcp-sync.js" ]]; then
+  node "$ROOT/scripts/mcp-sync.js" >>"$STATE_DIR/logs/mcp-sync.log" 2>&1 || true
+fi
+
 run_go_tui() {
   local executor_pid=""
   local opencode_pid=""
   local system_pid=""
-  ensure_tmux_session
+
+  # Start background executors (node-based)
   if command -v node >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then
     mkdir -p "$STATE_DIR_ABS/logs"
     node "$ROOT/ui/tui/codex-executor.js" --state-dir "$STATE_DIR_ABS" --repo-root "$ROOT" >>"$STATE_DIR_ABS/logs/codex-executor.log" 2>&1 &
@@ -81,12 +88,72 @@ run_go_tui() {
     system_pid="$!"
   fi
 
-  bash -lc "cd \"$ROOT/ui/tui\" && go run ."
-  local rc=$?
+  # Default: use full tmux layout with status panes (unless WORKBENCH_GO_TUI_TMUX=0)
+  # Set WORKBENCH_GO_TUI_TMUX=0 to run Go TUI in single-window mode
+  if [[ "${WORKBENCH_GO_TUI_TMUX:-1}" == "1" ]] && command -v tmux >/dev/null 2>&1; then
+    export WORKBENCH_GO_TUI=1
+    export WORKBENCH_STATE_DIR="$STATE_DIR_ABS"
+    bash "$ROOT/scripts/tmux_start.sh"
+    local rc=$?
+  else
+    ensure_tmux_session
+    # Pass absolute state directory so OAuth pool and other state is found correctly
+    bash -lc "cd \"$ROOT/ui/tui\" && WORKBENCH_STATE_DIR=\"$STATE_DIR_ABS\" go run ."
+    local rc=$?
+  fi
 
   if [[ -n "${executor_pid}" ]]; then
     kill "${executor_pid}" >/dev/null 2>&1 || true
     wait "${executor_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${opencode_pid}" ]]; then
+    kill "${opencode_pid}" >/dev/null 2>&1 || true
+    wait "${opencode_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${system_pid}" ]]; then
+    kill "${system_pid}" >/dev/null 2>&1 || true
+    wait "${system_pid}" >/dev/null 2>&1 || true
+  fi
+
+  return $rc
+}
+
+run_tmux_orchestrator() {
+  local codex_pid=""
+  local opencode_pid=""
+  local system_pid=""
+
+  # Start background executors (host-side). Orchestrator relies on system-executor for popups/actions.
+  if command -v node >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then
+    mkdir -p "$STATE_DIR_ABS/logs"
+    node "$ROOT/ui/tui/codex-executor.js" --state-dir "$STATE_DIR_ABS" --repo-root "$ROOT" >>"$STATE_DIR_ABS/logs/codex-executor.log" 2>&1 &
+    codex_pid="$!"
+  fi
+  if command -v node >/dev/null 2>&1 && { command -v opencode >/dev/null 2>&1 || [[ -n "${WORKBENCH_OPENCODE_BIN:-}" ]]; }; then
+    mkdir -p "$STATE_DIR_ABS/logs"
+    node "$ROOT/ui/tui/opencode-executor.js" --state-dir "$STATE_DIR_ABS" --repo-root "$ROOT" >>"$STATE_DIR_ABS/logs/opencode-executor.log" 2>&1 &
+    opencode_pid="$!"
+  fi
+  if command -v node >/dev/null 2>&1; then
+    mkdir -p "$STATE_DIR_ABS/logs"
+    node "$ROOT/ui/tui/system-executor.js" --state-dir "$STATE_DIR_ABS" --repo-root "$ROOT" >>"$STATE_DIR_ABS/logs/system-executor.log" 2>&1 &
+    system_pid="$!"
+  fi
+
+  # Autostart surface: only if explicitly set via env var.
+  # UI starts first; users can launch provider surfaces from the control panel.
+  # Set WORKBENCH_AUTOSTART_SURFACE=codex or =claude-code to auto-launch a provider.
+
+  export WORKBENCH_STATE_DIR="$STATE_DIR_ABS"
+  export WORKBENCH_TMUX_ORCHESTRATOR=1
+  export WORKBENCH_GO_TUI=0
+
+  bash "$ROOT/scripts/tmux_start.sh"
+  local rc=$?
+
+  if [[ -n "${codex_pid}" ]]; then
+    kill "${codex_pid}" >/dev/null 2>&1 || true
+    wait "${codex_pid}" >/dev/null 2>&1 || true
   fi
   if [[ -n "${opencode_pid}" ]]; then
     kill "${opencode_pid}" >/dev/null 2>&1 || true
@@ -167,27 +234,49 @@ run_docker_go_tui() {
 
 run_legacy_tui() {
   local topo="${WORKBENCH_TMUX_TOPOLOGY:-panes}"
+  local executor_pid=""
+
+  if command -v node >/dev/null 2>&1; then
+    mkdir -p "$STATE_DIR_ABS/logs"
+    node "$ROOT/ui/tui/system-executor.js" --state-dir "$STATE_DIR_ABS" --repo-root "$ROOT" >>"$STATE_DIR_ABS/logs/system-executor.log" 2>&1 &
+    executor_pid="$!"
+  fi
+
+  local rc=0
+  local use_tmux=1
   if command -v tmux >/dev/null 2>&1 && is_interactive_tty; then
     case "$topo" in
       windows)
-        exec bash "$ROOT/scripts/tmux_windows_start.sh"
+        bash "$ROOT/scripts/tmux_windows_start.sh"; rc=$?
         ;;
       panes)
-        exec bash "$ROOT/scripts/tmux_start.sh"
+        bash "$ROOT/scripts/tmux_start.sh"; rc=$?
         ;;
       none)
-        # fall through to single-terminal mode
+        use_tmux=0
         ;;
       *)
-        exec bash "$ROOT/scripts/tmux_windows_start.sh"
+        bash "$ROOT/scripts/tmux_windows_start.sh"; rc=$?
         ;;
     esac
+  else
+    use_tmux=0
   fi
 
-  if command -v bun >/dev/null 2>&1; then
-    exec bun ui/tui/ink-entry.js "$@"
+  if [[ "$use_tmux" != "1" ]]; then
+    if command -v bun >/dev/null 2>&1; then
+      bun ui/tui/ink-entry.js "$@"; rc=$?
+    else
+      node ui/tui/ink-entry.js "$@"; rc=$?
+    fi
   fi
-  exec node ui/tui/ink-entry.js "$@"
+
+  if [[ -n "${executor_pid}" ]]; then
+    kill "${executor_pid}" >/dev/null 2>&1 || true
+    wait "${executor_pid}" >/dev/null 2>&1 || true
+  fi
+
+  return $rc
 }
 
 is_interactive_tty() {
@@ -252,6 +341,10 @@ shift || true
 
 case "$cmd" in
   "" )
+    if command -v tmux >/dev/null 2>&1 && is_interactive_tty; then
+      run_tmux_orchestrator
+      exit $?
+    fi
     if command -v go >/dev/null 2>&1; then
       run_go_tui
       exit $?

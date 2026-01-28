@@ -1,11 +1,48 @@
 {
   "mcpServers": {
-    "workbench-workbench-docker": {
-      "command": "bun",
-      "args": ["mcp/servers/workbench-docker/src/index.js"],
+    "workbench": {
+      "command": "node",
+      "args": [
+        "/home/chanhokim/projects/myLLMworkbench/mcp/servers/workbench/bin/stdio.js"
+      ],
       "env": {
-        "WORKBENCH_DOCKER_IMAGE": "myworkbench:latest",
-        "WORKBENCH_STATE_DIR": ".workbench"
+        "WORKBENCH_STATE_DIR": "/home/chanhokim/projects/myLLMworkbench/.workbench"
+      }
+    },
+    "workbench-docker": {
+      "command": "bun",
+      "args": [
+        "/home/chanhokim/projects/myLLMworkbench/mcp/servers/docker/src/index.js"
+      ],
+      "env": {
+        "WORKBENCH_STATE_DIR": "/home/chanhokim/projects/myLLMworkbench/.workbench"
+      }
+    },
+    "workbench-workflow": {
+      "command": "bun",
+      "args": [
+        "/home/chanhokim/projects/myLLMworkbench/mcp/servers/workflow/src/index.js"
+      ],
+      "env": {
+        "WORKBENCH_STATE_DIR": "/home/chanhokim/projects/myLLMworkbench/.workbench"
+      }
+    },
+    "workbench-registry": {
+      "command": "bun",
+      "args": [
+        "/home/chanhokim/projects/myLLMworkbench/mcp/servers/registry/src/index.js"
+      ],
+      "env": {
+        "WORKBENCH_STATE_DIR": "/home/chanhokim/projects/myLLMworkbench/.workbench"
+      }
+    },
+    "workbench-container": {
+      "command": "bun",
+      "args": [
+        "/home/chanhokim/projects/myLLMworkbench/mcp/servers/workbench-docker/src/index.js"
+      ],
+      "env": {
+        "WORKBENCH_STATE_DIR": "/home/chanhokim/projects/myLLMworkbench/.workbench"
       }
     }
   }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ type codexTurnRequest struct {
 	Model         string `json:"model,omitempty"`
 	NoShell       bool   `json:"noShell,omitempty"`
 	Think         bool   `json:"think,omitempty"` // request narrated reasoning/plan stream
+	PermissionMode string `json:"permissionMode,omitempty"` // plan|bypass (executor-defined)
 }
 
 type codexTurnResponse struct {
@@ -202,4 +204,34 @@ func isCodexExecutorReady(stateDir string, sessionID string, now time.Time) bool
 		return false
 	}
 	return true
+}
+
+// codexExecutorDiagnostic returns a human-readable reason why the executor is not ready.
+// Returns empty string if everything looks fine.
+func codexExecutorDiagnostic(stateDir string, sessionID string, now time.Time) string {
+	// Check if codex CLI is available in PATH
+	codexPath, err := exec.LookPath("codex")
+	if err != nil || codexPath == "" {
+		return "codex CLI not installed. Run: npm install -g @openai/codex-cli"
+	}
+
+	// Check if node is available in PATH
+	nodePath, err := exec.LookPath("node")
+	if err != nil || nodePath == "" {
+		return "Node.js not installed. Required for Codex executor."
+	}
+
+	// Check heartbeat file
+	p := codexExecutorReadyPath(stateDir, sessionID)
+	st, err := os.Stat(p)
+	if err != nil {
+		return "Codex executor not running. Check logs: .workbench/logs/codex-executor.log"
+	}
+
+	// Check if heartbeat is stale
+	if now.Sub(st.ModTime()) > 30*time.Second {
+		return "Codex executor heartbeat stale. Executor may have crashed. Check: .workbench/logs/codex-executor.log"
+	}
+
+	return ""
 }

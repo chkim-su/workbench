@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { DEFAULT_PERMISSION_MODE } from './permissionModes.js';
 
 /**
  * Session management for TUI
@@ -14,15 +15,17 @@ export class SessionManager {
   }
 
   /**
-   * Create a new session with the given mode
+   * Create a new session with the given mode and permission mode
    * @param {string} mode - 'A' for Controlled, 'B' for Compatibility
+   * @param {string} permissionMode - 'plan' or 'bypass' (defaults to 'plan')
    * @returns {object} The created session
    */
-  createSession(mode) {
+  createSession(mode, permissionMode = DEFAULT_PERMISSION_MODE) {
     const id = randomUUID();
     this.current = {
       id,
       mode,
+      permissionMode,
       createdAt: new Date().toISOString(),
       messages: [],
     };
@@ -66,6 +69,25 @@ export class SessionManager {
    */
   getMode() {
     return this.current?.mode ?? null;
+  }
+
+  /**
+   * Get permission mode
+   * @returns {string} 'plan' or 'bypass' (defaults to 'plan')
+   */
+  getPermissionMode() {
+    return this.current?.permissionMode ?? DEFAULT_PERMISSION_MODE;
+  }
+
+  /**
+   * Set permission mode for current session
+   * @param {string} permissionMode - 'plan' or 'bypass'
+   */
+  setPermissionMode(permissionMode) {
+    if (this.current) {
+      this.current.permissionMode = permissionMode;
+      this.current.permissionModeChangedAt = new Date().toISOString();
+    }
   }
 
   /**

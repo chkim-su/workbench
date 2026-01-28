@@ -2,15 +2,16 @@ import React, { useState, useEffect } from 'react';
 import { Box, Text, useInput, useApp, useStdout } from 'ink';
 import { Spinner } from '@inkjs/ui';
 import { TuiState, aggregateState, probeCapabilities } from './state.js';
-import { ProcessManager, PANE } from './process.js';
 import { SessionManager } from './session.js';
 import { join, resolve } from 'node:path';
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import OAuthLogin from './OAuthLogin.jsx';
 import OAuthStatus from './OAuthStatus.jsx';
 import ModeSelector from './components/ModeSelector.jsx';
+import PermissionModeSelector from './components/PermissionModeSelector.jsx';
 import Menu from './components/Menu.jsx';
-import Chat from './Chat.jsx';
+import { DEFAULT_PERMISSION_MODE } from './permissionModes.js';
+import { appendSystemRequest, isSystemExecutorReady, newCorrelationId } from './system-client.js';
 
 // ─── Constants ───
 
@@ -21,11 +22,18 @@ const VERSION = '0.1.0';
 
 // Menu structure with categories
 const MAIN_MENU = [
-  { label: 'Chat with Codex', value: 'chat', icon: '💬' },
-  { label: 'OAuth Management', value: 'oauth-menu', icon: '🔐' },
-  { label: 'Run & Verify', value: 'run-menu', icon: '🚀' },
-  { label: 'System Status', value: 'status', icon: '📊' },
-  { label: 'Exit', value: 'exit', icon: '👋' },
+  { label: 'Launch Provider', value: 'provider-menu', icon: '>' },
+  { label: 'OAuth Management', value: 'oauth-menu', icon: '*' },
+  { label: 'Run & Verify', value: 'run-menu', icon: '!' },
+  { label: 'System Status', value: 'status', icon: '#' },
+  { label: 'Exit', value: 'exit', icon: 'x' },
+];
+
+const PROVIDER_MENU = [
+  { label: 'Codex (OAuth)', value: 'launch-codex', desc: 'Launch Codex in main pane with OAuth' },
+  { label: 'Claude Code', value: 'launch-claude-code', desc: 'Launch Claude Code in main pane' },
+  { label: 'Bash Shell', value: 'launch-bash', desc: 'Launch a bash shell in main pane' },
+  { label: '<- Back', value: 'back' },
 ];
 
 const OAUTH_MENU = [
@@ -329,8 +337,9 @@ export default function App() {
   const cols = stdout?.columns || 80;
   const rows = stdout?.rows || 24;
   const [sessionMode, setSessionMode] = useState(null); // null = show mode selector, 'A' | 'B' = selected mode
+  const [permissionMode, setPermissionMode] = useState(null); // null = show selector after mode, 'plan' | 'bypass'
   const [state, setState] = useState({
-    mode: 'menu', // menu | oauth-menu | run-menu | oauth | oauth-status | chat | running | status
+    mode: 'menu', // menu | provider-menu | oauth-menu | run-menu | oauth | oauth-status | running | status
     verifyGates: [],
     verifyRunId: null,
     runnerStatus: null,
@@ -341,7 +350,6 @@ export default function App() {
     capabilities: {},
   });
 
-  const pm = new ProcessManager(process.env.WORKBENCH_TMUX_SESSION || 'workbench');
   const root = repoRoot();
   const base = stateDir(root);
   const directory = root.split('/').pop() || root;
@@ -387,7 +395,7 @@ export default function App() {
       exit();
     }
     // Escape returns to main menu from submenus
-    if (key.escape && ['oauth-menu', 'run-menu'].includes(state.mode)) {
+    if (key.escape && ['provider-menu', 'oauth-menu', 'run-menu'].includes(state.mode)) {
       setState((s) => ({ ...s, mode: 'menu' }));
     }
   });
@@ -408,11 +416,22 @@ export default function App() {
     }
   };
 
+  const requestSystemAction = ({ type, statusMessage, payload = {} }) => {
+    if (!isSystemExecutorReady(base)) {
+      showNotification('System executor offline. Start Workbench from a terminal so it can run host actions.', 'error');
+      return false;
+    }
+    const correlationId = newCorrelationId();
+    appendSystemRequest(base, { type, correlationId, ...payload });
+    setState((s) => ({ ...s, mode: 'running', statusMessage }));
+    return true;
+  };
+
   // Handle main menu selection
   const handleMainSelect = (value) => {
     switch (value) {
-      case 'chat':
-        setState((s) => ({ ...s, mode: 'chat' }));
+      case 'provider-menu':
+        setState((s) => ({ ...s, mode: 'provider-menu' }));
         break;
       case 'oauth-menu':
         setState((s) => ({ ...s, mode: 'oauth-menu' }));
@@ -429,14 +448,39 @@ export default function App() {
     }
   };
 
+  // Handle provider menu selection
+  const handleProviderSelect = (value) => {
+    if (value === 'back') {
+      setState((s) => ({ ...s, mode: 'menu' }));
+      return;
+    }
+
+    const surfaceMap = {
+      'launch-codex': 'codex',
+      'launch-claude-code': 'claude-code',
+      'launch-bash': 'bash',
+    };
+
+    const surface = surfaceMap[value];
+    if (surface) {
+      requestSystemAction({
+        type: 'surface.launch',
+        statusMessage: `Launching ${surface}...`,
+        payload: {
+          surface,
+          cwd: root,
+          syncOAuth: surface === 'codex',
+        },
+      });
+    }
+  };
+
   // Handle OAuth submenu selection
   const handleOAuthSelect = async (value) => {
     if (value === 'back') {
       setState((s) => ({ ...s, mode: 'menu' }));
       return;
     }
-
-    const hasTmux = pm.hasTmux() && pm.hasSession();
 
     switch (value) {
       case 'oauth-status':
@@ -501,12 +545,11 @@ export default function App() {
         break;
 
       case 'oauth-sync':
-        if (hasTmux) {
-          pm.runOAuthSync(false);
-          setState((s) => ({ ...s, mode: 'running', statusMessage: 'Syncing OAuth tokens...' }));
-        } else {
-          showNotification('tmux required for this operation', 'error');
-        }
+        requestSystemAction({
+          type: 'oauth.sync',
+          statusMessage: 'Syncing OAuth tokens...',
+          payload: { watch: false },
+        });
         break;
     }
   };
@@ -518,39 +561,44 @@ export default function App() {
       return;
     }
 
-    const hasTmux = pm.hasTmux() && pm.hasSession();
-
-    if (!hasTmux) {
-      showNotification('tmux required for this operation', 'error');
-      return;
-    }
-
     switch (value) {
       case 'verify-fast':
-        pm.runVerifyFast();
-        setState((s) => ({ ...s, mode: 'running', statusMessage: 'Running fast verification...' }));
+        requestSystemAction({
+          type: 'verify',
+          statusMessage: 'Running fast verification...',
+          payload: { full: false },
+        });
         break;
 
       case 'verify-full':
-        pm.runVerifyFull();
-        setState((s) => ({ ...s, mode: 'running', statusMessage: 'Running full verification...' }));
+        requestSystemAction({
+          type: 'verify',
+          statusMessage: 'Running full verification...',
+          payload: { full: true },
+        });
         break;
 
       case 'runner-mock':
-        pm.runRunnerMock();
-        setState((s) => ({ ...s, mode: 'running', statusMessage: 'Running mock test...' }));
+        requestSystemAction({
+          type: 'runner.smoke',
+          statusMessage: 'Running mock test...',
+          payload: { provider: 'mock' },
+        });
         break;
 
       case 'runner-oauth':
-        pm.triggerInPane(PANE.RUNNER, 'python3 runner/auth/openai_oauth_sync.py && python3 runner/run_smoke.py', {
-          WORKBENCH_PROVIDER: 'openai-oauth',
+        requestSystemAction({
+          type: 'runner.smoke',
+          statusMessage: 'Running OAuth test...',
+          payload: { provider: 'openai-oauth', syncOAuth: true },
         });
-        setState((s) => ({ ...s, mode: 'running', statusMessage: 'Running OAuth test...' }));
         break;
 
       case 'install':
-        pm.runInstall();
-        setState((s) => ({ ...s, mode: 'running', statusMessage: 'Installing dependencies...' }));
+        requestSystemAction({
+          type: 'install',
+          statusMessage: 'Installing dependencies...',
+        });
         break;
     }
   };
@@ -559,8 +607,15 @@ export default function App() {
   const handleModeChange = (mode) => {
     setSessionMode(mode);
     if (mode === null) {
+      setPermissionMode(null); // Also reset permission mode to show selector again
       setState((s) => ({ ...s, mode: 'menu' }));
     }
+  };
+
+  // Handle permission mode change
+  const handlePermissionModeChange = (pMode) => {
+    setPermissionMode(pMode);
+    sessionManager.setPermissionMode(pMode);
   };
 
   // Stable fallback: avoid complex layouts on tiny terminals (prevents wrap jitter/flicker).
@@ -581,7 +636,21 @@ export default function App() {
       <ModeSelector
         onSelect={(mode) => {
           setSessionMode(mode);
-          sessionManager.createSession(mode);
+        }}
+      />
+    );
+  }
+
+  // Show permission mode selector after session mode selection
+  if (permissionMode === null) {
+    return (
+      <PermissionModeSelector
+        onSelect={(pMode) => {
+          setPermissionMode(pMode);
+          sessionManager.createSession(sessionMode, pMode);
+        }}
+        onBack={() => {
+          setSessionMode(null);
         }}
       />
     );
@@ -606,17 +675,6 @@ export default function App() {
     );
   }
 
-  if (state.mode === 'chat') {
-    return (
-      <Chat
-        provider="openai-oauth"
-        sessionMode={sessionMode}
-        sessionManager={sessionManager}
-        onClose={() => setState((s) => ({ ...s, mode: 'menu' }))}
-        onModeChange={handleModeChange}
-      />
-    );
-  }
 
   if (state.mode === 'status') {
     return (
@@ -653,6 +711,14 @@ export default function App() {
             onSelect={handleMainSelect}
             oauthPool={state.oauthPool}
             verifyGates={state.verifyGates}
+          />
+        )}
+
+        {state.mode === 'provider-menu' && (
+          <SubMenuView
+            title="Launch Provider"
+            items={PROVIDER_MENU}
+            onSelect={handleProviderSelect}
           />
         )}
 

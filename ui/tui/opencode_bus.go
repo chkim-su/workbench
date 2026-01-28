@@ -18,6 +18,7 @@ type opencodeTurnRequest struct {
 	Model         string `json:"model,omitempty"` // provider/model (OpenCode format)
 	Agent         string `json:"agent,omitempty"`
 	Think         bool   `json:"think,omitempty"` // request narrated reasoning/plan stream
+	PermissionMode string `json:"permissionMode,omitempty"` // plan|bypass (executor-defined)
 }
 
 type opencodeTurnResponse struct {

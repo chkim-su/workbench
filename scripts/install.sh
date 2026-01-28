@@ -315,6 +315,43 @@ install_go_if_missing() {
   fi
 }
 
+# Install tmux if not present (required for full TUI layout)
+install_tmux_if_missing() {
+  if command -v tmux >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local OS=""
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    OS="$ID"
+  fi
+
+  echo "[workbench-install] Installing tmux..."
+  case "$OS" in
+    ubuntu|debian)
+      sudo apt-get update -qq 2>/dev/null || true
+      sudo apt-get install -y tmux >/dev/null 2>&1
+      ;;
+    fedora|rhel|centos|rocky|almalinux)
+      sudo dnf install -y tmux >/dev/null 2>&1 || sudo yum install -y tmux >/dev/null 2>&1
+      ;;
+    arch|manjaro)
+      sudo pacman -Sy --noconfirm tmux >/dev/null 2>&1
+      ;;
+    *)
+      echo "[workbench-install] WARNING: Cannot auto-install tmux on ${OS:-unknown}"
+      return 1
+      ;;
+  esac
+
+  if command -v tmux >/dev/null 2>&1; then
+    echo "[workbench-install] tmux installed successfully."
+  else
+    echo "[workbench-install] WARNING: tmux installation may have failed."
+  fi
+}
+
 # Install Docker if not present (separate from other prerequisites)
 install_docker_if_missing() {
   if command -v docker >/dev/null 2>&1; then
@@ -397,6 +434,9 @@ fi
 # Install Go (required for Bubble Tea TUI with reasoning traces)
 install_go_if_missing || true
 
+# Install tmux (required for full TUI layout)
+install_tmux_if_missing || true
+
 # Install Docker (optional but recommended for full verification)
 install_docker_if_missing || true
 
@@ -413,12 +453,12 @@ else
   echo "[workbench-install]   The Bubble Tea TUI requires Go. Using legacy Ink TUI."
 fi
 
-# Check for tmux (optional but recommended for 4-pane layout)
+# Check for tmux (required for full TUI layout)
 if command -v tmux >/dev/null 2>&1; then
   echo "[workbench-install] tmux=$(tmux -V)"
 else
   echo "[workbench-install] WARNING: tmux not found"
-  echo "[workbench-install]   The TUI will work but without the 4-pane layout."
+  echo "[workbench-install]   Full TUI layout requires tmux. Install manually if auto-install failed."
 fi
 
 # Check for docker
@@ -440,6 +480,12 @@ if [[ "$SKIP_BUN" -eq 0 ]]; then
   bun install
 else
   echo "[workbench-install] skipping bun install"
+fi
+
+# Sync MCP servers to Claude Code and Codex config
+if [[ -f "$ROOT/scripts/mcp-sync.js" ]] && command -v node >/dev/null 2>&1; then
+  echo "[workbench-install] syncing MCP servers..."
+  node "$ROOT/scripts/mcp-sync.js" || echo "[workbench-install] WARNING: MCP sync had issues (non-fatal)"
 fi
 
 if [[ "$RUN_VERIFY" -eq 1 ]]; then

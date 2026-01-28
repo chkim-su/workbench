@@ -17,6 +17,7 @@ import fs from "node:fs"
 import path from "node:path"
 import crypto from "node:crypto"
 import { spawn } from "node:child_process"
+import { getSandboxArgs, getPermissionModeConfig, DEFAULT_PERMISSION_MODE } from "./permissionModes.js"
 
 function parseArgs(argv) {
   const out = { stateDir: null, repoRoot: process.cwd() }
@@ -54,7 +55,7 @@ function randomSessionId() {
   return `sess_${crypto.randomBytes(4).toString("hex")}`
 }
 
-function ensureSessionId(stateDir) {
+function readCurrentSessionId(stateDir) {
   const currentPath = path.join(stateDir, "state", "current.json")
   ensureDir(path.dirname(currentPath))
   let cur = { schemaVersion: 1 }
@@ -62,11 +63,17 @@ function ensureSessionId(stateDir) {
     try { cur = readJson(currentPath) } catch {}
   }
   if (typeof cur.sessionId === "string" && cur.sessionId.trim()) return cur.sessionId.trim()
-  const id = randomSessionId()
-  cur.sessionId = id
-  cur.updatedAt = nowIso()
+  return ""
+}
+
+function ensureSessionId(stateDir) {
+  const existing = readCurrentSessionId(stateDir)
+  if (existing) return existing
+  const currentPath = path.join(stateDir, "state", "current.json")
+  ensureDir(path.dirname(currentPath))
+  const cur = { schemaVersion: 1, sessionId: randomSessionId(), updatedAt: nowIso() }
   writeJson(currentPath, cur, 0o644)
-  return id
+  return cur.sessionId
 }
 
 function normalizeCwd(raw) {
@@ -134,6 +141,24 @@ function safeToolSummary(input) {
   return `keys=[${keys.join(", ")}]`
 }
 
+function truncate(s, max = 180) {
+  const txt = String(s ?? "").trim()
+  if (!txt) return ""
+  if (txt.length <= max) return txt
+  return txt.slice(0, Math.max(0, max-1)) + "…"
+}
+
+function emitReasoningAsThink(eventsPath, correlationId, text) {
+  const lines = String(text ?? "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+  // Keep it concise; this is a progress signal, not a full transcript.
+  for (const l of lines.slice(0, 6)) {
+    emitCodexTurnEvent(eventsPath, correlationId, { kind: "think", message: truncate(l, 220) })
+  }
+}
+
 function startCodexTurn({ repoRoot, stateDir, sessionId, request, codexHomeDir, uiEventsPath, phase, onDone }) {
   const startedAt = nowIso()
   const out = { ok: false, content: "", error: "", fileChanges: [], startedAt, endedAt: "" }
@@ -152,15 +177,25 @@ function startCodexTurn({ repoRoot, stateDir, sessionId, request, codexHomeDir, 
   const { profileName } = writeCodexAuthFromPool({ stateDir, codexHomeDir })
 
   const model = String(request.model ?? "").trim()
-  const args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "--cd", resolvedCwd]
+  const permissionMode = String(request.permissionMode ?? DEFAULT_PERMISSION_MODE).trim()
+  const permConfig = getPermissionModeConfig(permissionMode)
+  const sandboxArgs = getSandboxArgs(permissionMode)
+  const args = ["exec", "--json", ...sandboxArgs, "--skip-git-repo-check", "--cd", resolvedCwd]
   if (model) args.push("--model", model)
 
   const preludeLines = [
     "You are running inside the local Codex CLI runtime.",
-    "You can create/edit files in the working directory.",
-    "Do not claim you cannot create files.",
   ]
-  if (request.noShell) preludeLines.push("Do not run shell commands.")
+  if (permConfig.sandboxFlag === "read-only") {
+    preludeLines.push("This session is read-only: do not modify any files.")
+    preludeLines.push("You can still read files and run shell commands to inspect the repository; file writes will fail.")
+  } else {
+    preludeLines.push("You can create/edit files in the working directory.")
+    preludeLines.push("You can read files and run shell commands in the working directory.")
+  }
+  preludeLines.push("Do not claim you cannot create files unless the sandbox is read-only.")
+  // Apply noShell from permission config or explicit request
+  if (permConfig.noShell || request.noShell) preludeLines.push("Do not run shell commands.")
   if (phase === "think") {
     preludeLines.push("Do not modify any files. Do not run any commands. Output only a concise bullet plan.")
   } else {
@@ -212,9 +247,24 @@ function startCodexTurn({ repoRoot, stateDir, sessionId, request, codexHomeDir, 
       }
 
       // Best-effort: convert tool events into cockpit stream events.
-      if (uiEventsPath && ev?.type === "item.completed" && ev?.item && typeof ev.item === "object") {
+      if (uiEventsPath && (ev?.type === "item.completed" || ev?.type === "item.started") && ev?.item && typeof ev.item === "object") {
         const it = ev.item
         const itType = String(it.type ?? "").trim()
+        if (itType === "command_execution") {
+          const cmd = truncate(it.command, 220)
+          if (cmd) {
+            if (ev.type === "item.started") {
+              emitCodexTurnEvent(uiEventsPath, request.correlationId, { kind: "tool_use", tool: "bash", message: cmd })
+            } else {
+              const exitCode = it.exit_code ?? it.exitCode ?? null
+              const suffix = exitCode === null || exitCode === undefined ? "" : ` (exit=${exitCode})`
+              emitCodexTurnEvent(uiEventsPath, request.correlationId, { kind: "tool_use", tool: "bash", message: cmd + suffix })
+            }
+          }
+        }
+        if (itType === "reasoning" && ev.type === "item.completed" && typeof it.text === "string") {
+          emitReasoningAsThink(uiEventsPath, request.correlationId, it.text)
+        }
         if (itType === "tool_call" || itType === "tool" || itType === "tool_use") {
           const tool = String(it.name ?? it.tool ?? it.tool_name ?? it.call?.name ?? "tool").trim()
           const title = String(it.title ?? "").trim()
@@ -273,14 +323,14 @@ async function main() {
   const stateDir = args.stateDir ? path.resolve(args.stateDir) : path.resolve(process.env.WORKBENCH_STATE_DIR || ".workbench")
   const repoRoot = path.resolve(args.repoRoot || process.cwd())
 
-  const sessionId = ensureSessionId(stateDir)
-  const sessionDir = path.join(stateDir, sessionId)
+  let sessionId = ensureSessionId(stateDir)
+  let sessionDir = path.join(stateDir, sessionId)
   ensureDir(sessionDir)
 
-  const requestsPath = path.join(sessionDir, "codex.requests.jsonl")
-  const responsesPath = path.join(sessionDir, "codex.responses.jsonl")
-  const uiEventsPath = path.join(sessionDir, "codex.events.jsonl")
-  const readyPath = path.join(sessionDir, "codex.executor.json")
+  let requestsPath = path.join(sessionDir, "codex.requests.jsonl")
+  let responsesPath = path.join(sessionDir, "codex.responses.jsonl")
+  let uiEventsPath = path.join(sessionDir, "codex.events.jsonl")
+  let readyPath = path.join(sessionDir, "codex.executor.json")
 
   if (!fs.existsSync(requestsPath)) fs.writeFileSync(requestsPath, "", "utf8")
   if (!fs.existsSync(responsesPath)) fs.writeFileSync(responsesPath, "", "utf8")
@@ -300,8 +350,39 @@ async function main() {
 
   setInterval(() => touchReady(), 5_000)
 
+  const switchSession = (nextId) => {
+    if (!nextId || nextId === sessionId) return
+    if (inFlight && typeof inFlight.cancel === "function") {
+      try { inFlight.cancel() } catch {}
+    }
+    inFlight = null
+    offset = 0
+
+    sessionId = nextId
+    sessionDir = path.join(stateDir, sessionId)
+    ensureDir(sessionDir)
+
+    requestsPath = path.join(sessionDir, "codex.requests.jsonl")
+    responsesPath = path.join(sessionDir, "codex.responses.jsonl")
+    uiEventsPath = path.join(sessionDir, "codex.events.jsonl")
+    readyPath = path.join(sessionDir, "codex.executor.json")
+
+    if (!fs.existsSync(requestsPath)) fs.writeFileSync(requestsPath, "", "utf8")
+    if (!fs.existsSync(responsesPath)) fs.writeFileSync(responsesPath, "", "utf8")
+    if (!fs.existsSync(uiEventsPath)) fs.writeFileSync(uiEventsPath, "", "utf8")
+
+    touchReady()
+  }
+
   while (true) {
     await new Promise((r) => setTimeout(r, 200))
+
+    // Follow the current session pointer.
+    const desired = readCurrentSessionId(stateDir) || sessionId
+    if (desired !== sessionId) {
+      switchSession(desired)
+      continue
+    }
 
     let st = null
     try { st = fs.statSync(requestsPath) } catch { continue }

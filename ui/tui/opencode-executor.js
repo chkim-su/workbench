@@ -54,7 +54,7 @@ function randomSessionId() {
   return `sess_${crypto.randomBytes(4).toString("hex")}`
 }
 
-function ensureSessionId(stateDir) {
+function readCurrentSessionId(stateDir) {
   const currentPath = path.join(stateDir, "state", "current.json")
   ensureDir(path.dirname(currentPath))
   let cur = { schemaVersion: 1 }
@@ -64,11 +64,17 @@ function ensureSessionId(stateDir) {
     } catch {}
   }
   if (typeof cur.sessionId === "string" && cur.sessionId.trim()) return cur.sessionId.trim()
-  const id = randomSessionId()
-  cur.sessionId = id
-  cur.updatedAt = nowIso()
+  return ""
+}
+
+function ensureSessionId(stateDir) {
+  const existing = readCurrentSessionId(stateDir)
+  if (existing) return existing
+  const currentPath = path.join(stateDir, "state", "current.json")
+  ensureDir(path.dirname(currentPath))
+  const cur = { schemaVersion: 1, sessionId: randomSessionId(), updatedAt: nowIso() }
   writeJson(currentPath, cur, 0o644)
-  return id
+  return cur.sessionId
 }
 
 function normalizeCwd(raw) {
@@ -96,28 +102,9 @@ function ensureOpencodeConfig({ stateDir }) {
   }
   for (const p of Object.values(xdg)) ensureDir(p)
 
-  const cfgPath = path.join(xdg.XDG_CONFIG_HOME, "opencode", "config.json")
-  if (!fs.existsSync(cfgPath)) {
-    const cfg = {
-      $schema: "https://opencode.ai/config.json",
-      permission: {
-        read: "allow",
-        edit: "allow",
-        glob: "allow",
-        grep: "allow",
-        list: "allow",
-        // Keep this managed executor deterministic/non-interactive.
-        // If you want bash/web tools, run OpenCode as a native surface instead.
-        bash: "deny",
-        external_directory: "deny",
-        webfetch: "deny",
-        websearch: "deny",
-        codesearch: "deny",
-        doom_loop: "deny",
-      },
-    }
-    writeJson(cfgPath, cfg, 0o600)
-  }
+  const cfgDir = path.join(xdg.XDG_CONFIG_HOME, "opencode")
+  ensureDir(cfgDir)
+  const cfgPath = path.join(cfgDir, "config.json")
 
   return { ...xdg, OPENCODE_TEST_HOME: base }
 }
@@ -132,6 +119,16 @@ function safeJsonParse(line) {
   } catch {
     return null
   }
+}
+
+function looksLikeOpencodePlainError(line) {
+  const s = String(line || "").trim()
+  if (!s) return false
+  if (s.startsWith("error:")) return true
+  if (s.toLowerCase().includes("unable to connect")) return true
+  if (s.toLowerCase().includes("connectionrefused")) return true
+  if (s.toLowerCase().includes("connection refused")) return true
+  return false
 }
 
 function emitTurnEvent(eventsPath, correlationId, { kind, message, tool }) {
@@ -195,6 +192,33 @@ function startOpencodeTurn({ repoRoot, stateDir, sessionId, request, onDone }) {
   const model = String(request.model ?? "").trim()
   const prompt = String(request.prompt ?? "")
   const wantThink = request.think === true
+  const permissionMode = String(request.permissionMode ?? "plan").trim().toLowerCase()
+
+  // Apply permissions per-turn (isolated Workbench config under .workbench/opencode/).
+  // Planning: read-only, no bash.
+  // Bypass: allow edits + bash (still deny web/external dir for safety/determinism).
+  {
+    const cfgPath = path.join(xdgEnv.XDG_CONFIG_HOME, "opencode", "config.json")
+    const allowEdits = permissionMode === "bypass"
+    const allowBash = permissionMode === "bypass"
+    const cfg = {
+      $schema: "https://opencode.ai/config.json",
+      permission: {
+        read: "allow",
+        edit: allowEdits ? "allow" : "deny",
+        glob: "allow",
+        grep: "allow",
+        list: "allow",
+        bash: allowBash ? "allow" : "deny",
+        external_directory: "deny",
+        webfetch: "deny",
+        websearch: "deny",
+        codesearch: "deny",
+        doom_loop: "deny",
+      },
+    }
+    writeJson(cfgPath, cfg, 0o600)
+  }
 
   /** @type {import("node:child_process").ChildProcess | null} */
   let inFlightProc = null
@@ -214,11 +238,17 @@ function startOpencodeTurn({ repoRoot, stateDir, sessionId, request, onDone }) {
 
     emitTurnEvent(eventsPath, request.correlationId, {
       kind: phaseName === "think" ? "think" : "info",
-      message: phaseName === "think" ? "Planning (OpenCode plan agent)..." : `opencode run started (cwd=${resolvedCwd})`,
+      message: phaseName === "think"
+        ? "Planning (OpenCode plan agent)..."
+        : `opencode run started (cwd=${resolvedCwd}, permissionMode=${permissionMode || "plan"})`,
     })
 
     let phaseText = ""
     let phaseError = ""
+    let lastText = ""
+    let sawAnyJson = false
+    let plainOut = ""
+    let plainLooksError = false
     const proc = spawn(bin, args, { cwd: resolvedCwd, env: { ...process.env, ...xdgEnv, OPENCODE: "1" }, stdio: ["ignore", "pipe", "pipe"] })
     inFlightProc = proc
 
@@ -232,7 +262,16 @@ function startOpencodeTurn({ repoRoot, stateDir, sessionId, request, onDone }) {
         stdoutBuf = stdoutBuf.slice(idx + 1)
         if (!line) continue
         const ev = safeJsonParse(line)
-        if (!ev || typeof ev !== "object") continue
+        if (!ev || typeof ev !== "object") {
+          // OpenCode sometimes prints plaintext errors even in --format json mode.
+          // Treat any plaintext output as error signal (we asked for JSON).
+          if (plainOut.length < 4096) {
+            plainOut += (plainOut ? "\n" : "") + line
+          }
+          if (looksLikeOpencodePlainError(line)) plainLooksError = true
+          continue
+        }
+        sawAnyJson = true
 
         if (ev.type === "tool_use") {
           const { tool, message } = summarizeToolUse(ev.part)
@@ -249,8 +288,21 @@ function startOpencodeTurn({ repoRoot, stateDir, sessionId, request, onDone }) {
         }
 
         if (ev.type === "text") {
-          const text = String(ev.part?.text ?? "").trim()
-          if (text) phaseText = text
+          const text = String(ev.part?.text ?? "")
+          if (text) {
+            if (phaseName === "run") {
+              const delta = text.startsWith(lastText) ? text.slice(lastText.length) : text
+              // Stream deltas to the cockpit (best-effort). Keep chunks bounded.
+              if (delta.length) {
+                const max = 800
+                for (let i = 0; i < delta.length; i += max) {
+                  emitTurnEvent(eventsPath, request.correlationId, { kind: "delta", message: delta.slice(i, i + max) })
+                }
+              }
+            }
+            lastText = text
+            phaseText = text.trim()
+          }
           continue
         }
 
@@ -271,8 +323,21 @@ function startOpencodeTurn({ repoRoot, stateDir, sessionId, request, onDone }) {
 
     const exitCode = await new Promise((resolve) => proc.on("close", resolve))
     if (inFlightProc === proc) inFlightProc = null
-    const ok = exitCode === 0 && !phaseError
+    let ok = exitCode === 0 && !phaseError
+    if (ok && !sawAnyJson && plainOut.trim()) {
+      // If we got non-JSON output in json mode, surface it as an error (even if exitCode=0).
+      phaseError = plainOut.trim()
+      ok = false
+      emitTurnEvent(eventsPath, request.correlationId, { kind: "error", message: phaseError.split("\n")[0].slice(0, 200) })
+    }
     if (!ok && !phaseError && stderrBuf.trim()) phaseError = stderrBuf.trim()
+    if (!ok && phaseError && plainLooksError) {
+      // Also emit a concise error hint for the cockpit.
+      emitTurnEvent(eventsPath, request.correlationId, {
+        kind: "error",
+        message: "OpenCode failed (likely cannot reach models.dev). If offline, switch runtime to Codex – Chat/CLI.",
+      })
+    }
 
     if (captureText && phaseText) {
       // Emit one line per non-empty line for a quasi-streaming “thinking” display.
@@ -337,14 +402,14 @@ async function main() {
   const stateDir = args.stateDir ? path.resolve(args.stateDir) : path.resolve(process.env.WORKBENCH_STATE_DIR || ".workbench")
   const repoRoot = path.resolve(args.repoRoot || process.cwd())
 
-  const sessionId = ensureSessionId(stateDir)
-  const sessionDir = path.join(stateDir, sessionId)
+  let sessionId = ensureSessionId(stateDir)
+  let sessionDir = path.join(stateDir, sessionId)
   ensureDir(sessionDir)
 
-  const requestsPath = path.join(sessionDir, "opencode.requests.jsonl")
-  const responsesPath = path.join(sessionDir, "opencode.responses.jsonl")
-  const eventsPath = path.join(sessionDir, "opencode.events.jsonl")
-  const readyPath = path.join(sessionDir, "opencode.executor.json")
+  let requestsPath = path.join(sessionDir, "opencode.requests.jsonl")
+  let responsesPath = path.join(sessionDir, "opencode.responses.jsonl")
+  let eventsPath = path.join(sessionDir, "opencode.events.jsonl")
+  let readyPath = path.join(sessionDir, "opencode.executor.json")
 
   for (const p of [requestsPath, responsesPath, eventsPath]) {
     if (!fs.existsSync(p)) fs.writeFileSync(p, "", "utf8")
@@ -359,8 +424,37 @@ async function main() {
   touchReady()
   setInterval(() => touchReady(), 5_000)
 
+  const switchSession = (nextId) => {
+    if (!nextId || nextId === sessionId) return
+    if (inFlight && typeof inFlight.cancel === "function") {
+      try { inFlight.cancel() } catch {}
+    }
+    inFlight = null
+    offset = 0
+
+    sessionId = nextId
+    sessionDir = path.join(stateDir, sessionId)
+    ensureDir(sessionDir)
+
+    requestsPath = path.join(sessionDir, "opencode.requests.jsonl")
+    responsesPath = path.join(sessionDir, "opencode.responses.jsonl")
+    eventsPath = path.join(sessionDir, "opencode.events.jsonl")
+    readyPath = path.join(sessionDir, "opencode.executor.json")
+
+    for (const p of [requestsPath, responsesPath, eventsPath]) {
+      if (!fs.existsSync(p)) fs.writeFileSync(p, "", "utf8")
+    }
+    touchReady()
+  }
+
   while (true) {
     await new Promise((r) => setTimeout(r, 200))
+
+    const desired = readCurrentSessionId(stateDir) || sessionId
+    if (desired !== sessionId) {
+      switchSession(desired)
+      continue
+    }
 
     let st = null
     try { st = fs.statSync(requestsPath) } catch { continue }

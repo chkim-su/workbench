@@ -1,0 +1,18 @@
+{
+  "name": "@workbench/mcp",
+  "version": "0.1.0",
+  "description": "Workbench MCP Server - shared instance for Codex & Claude Code",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "workbench-mcp": "./bin/stdio.js",
+    "workbench-mcp-http": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "start:stdio": "node bin/stdio.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

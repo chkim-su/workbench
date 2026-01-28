@@ -17,6 +17,7 @@
  *   tui                  Launch interactive TUI (default)
  *   doctor               Probe environment capabilities
  *   verify [--full]      Run verification gates
+ *   dev <action>         Headless TUI control (Docker + command bus)
  *   workflow <action>    Workflow operations
  *   state <action>       State inspection
  *   logs [--follow]      View/tail logs
@@ -156,6 +157,7 @@ Commands:
   tui                  Launch interactive TUI (default)
   doctor               Probe environment capabilities
   verify [--full]      Run verification gates
+  dev <action>         Headless TUI control (Docker + command bus)
   workflow <action>    Workflow operations (status, init, cancel)
   state <action>       State inspection (show, export, clear)
   logs [--follow]      View/tail logs
@@ -171,6 +173,10 @@ Examples:
   workbench                          # Launch TUI (default)
   workbench doctor --json            # Check environment, JSON output
   workbench verify --full --json     # Run full verification
+  workbench dev start --mode B --json   # Start headless Docker session
+  workbench dev set --session <id> --runtime codex-cli --thought-stream 1
+  workbench dev send --session <id> --text "analyze the project"
+  workbench dev follow --session <id>   # Tail session events for supervision
   workbench logs --follow            # Tail log file
   workbench workflow status          # Show workflow status
 `;
@@ -210,7 +216,7 @@ async function runCommand(name, args, context) {
     logger.error('command_not_found', `Unknown command: ${name}`);
     output.writeError('UNKNOWN_COMMAND', `Unknown command: ${name}`, {
       command: name,
-      availableCommands: ['tui', 'doctor', 'verify', 'workflow', 'state', 'logs'],
+      availableCommands: ['tui', 'doctor', 'verify', 'dev', 'workflow', 'state', 'logs'],
     });
     return 1;
   }

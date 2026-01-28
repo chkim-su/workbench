@@ -9,6 +9,16 @@ services:
     container_name: myworkbench
     stdin_open: true
     tty: true
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=256M,mode=1777
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - WORKBENCH_PROVIDER=${WORKBENCH_PROVIDER:-claude-code}

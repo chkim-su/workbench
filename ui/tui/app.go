@@ -34,8 +34,16 @@ func main() {
 
 	sessionID := strings.TrimSpace(sessionOverride)
 	if sessionID == "" {
-		sid, _ := getOrCreateSessionID(stateDir)
-		sessionID = sid
+		// Default behavior: start a new session unless explicitly asked to resume.
+		// This avoids "stuck busy" and confusing persistence when reopening Workbench in tmux.
+		if envBool("WORKBENCH_RESUME") || envBool("WORKBENCH_RESUME_SESSION") {
+			sid, _ := getOrCreateSessionID(stateDir)
+			sessionID = sid
+		} else {
+			sid, _ := createNewSessionID(stateDir)
+			_ = setCurrentSessionID(stateDir, sid)
+			sessionID = sid
+		}
 	}
 	mcpConnected := readMcpConnectedCount(stateDir)
 
@@ -268,4 +276,30 @@ func getOrCreateSessionID(stateDir string) (string, error) {
 		return id, err
 	}
 	return id, nil
+}
+
+func createNewSessionID(stateDir string) (string, error) {
+	buf := make([]byte, 4)
+	_, _ = rand.Read(buf)
+	id := "sess_" + hex.EncodeToString(buf)
+	// Ensure directory exists eagerly.
+	_ = os.MkdirAll(filepath.Join(stateDir, id), 0o755)
+	return id, nil
+}
+
+func setCurrentSessionID(stateDir string, sessionID string) error {
+	currentPath := filepath.Join(stateDir, "state", "current.json")
+	_ = os.MkdirAll(filepath.Dir(currentPath), 0o755)
+
+	var current map[string]any
+	if raw, err := os.ReadFile(currentPath); err == nil {
+		_ = json.Unmarshal(raw, &current)
+	}
+	if current == nil {
+		current = map[string]any{"schemaVersion": 1}
+	}
+	current["sessionId"] = sessionID
+	current["updatedAt"] = time.Now().UTC().Format(time.RFC3339)
+	b, _ := json.MarshalIndent(current, "", "  ")
+	return os.WriteFile(currentPath, append(b, '\n'), 0o644)
 }

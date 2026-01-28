@@ -33,9 +33,45 @@ tmux -L "$SERVER" set-window-option -g synchronize-panes off 2>/dev/null || true
 # Navigation helpers (no-prefix). These apply only to the Workbench tmux server (-L).
 tmux -L "$SERVER" bind-key -n F1 select-window -t "$SESSION:control" 2>/dev/null || true
 tmux -L "$SERVER" bind-key -n F2 select-window -t "$SESSION:ui" 2>/dev/null || true
+tmux -L "$SERVER" bind-key -n F4 select-pane -t "$SESSION:control.3" 2>/dev/null || true
+tmux -L "$SERVER" bind-key -n F3 display-popup -E -w 90% -h 90% -T "Workbench" \
+  "bash -lc '
+    export PATH=\"$HOME/.bun/bin:$PATH\"
+    ROOT=\"#{?@workbench_repo_root,#{@workbench_repo_root},#{pane_current_path}}\"
+    STATE=\"#{?@workbench_state_dir,#{@workbench_state_dir},.workbench}\"
+    TMUX_SERVER=\"#{?@workbench_tmux_server,#{@workbench_tmux_server},workbench}\"
+    TMUX_SESSION=\"#{?@workbench_tmux_session,#{@workbench_tmux_session},workbench}\"
+    if ! cd \"$ROOT\" 2>/dev/null; then cd \"#{pane_current_path}\" 2>/dev/null || true; fi
+    bun \"$ROOT/ui/tui/control-popup-entry.jsx\"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      echo \"\"
+      echo \"[workbench] F3 popup failed (rc=$rc)\"
+      echo \"ROOT=$ROOT\"
+      echo \"STATE=$STATE\"
+      echo \"PATH=$PATH\"
+      echo \"Press any key to close...\"
+      read -r -n 1 -s
+    fi
+    exit $rc
+  '" 2>/dev/null || true
+
+# Avoid hijacking app-level scroll/view keys (Codex/Workbench use PgUp/PgDn).
+tmux -L "$SERVER" unbind-key -n PageUp 2>/dev/null || true
+tmux -L "$SERVER" unbind-key -n PageDown 2>/dev/null || true
+
+# Mouse wheel behavior:
+# - For Workbench-rendered TUIs (Bubble Tea / Ink): forward PgUp/PgDn so app-level scrollback works.
+# - For raw provider surfaces (codex/claude/bash): keep tmux copy-mode scrolling so drag+select UX works.
+tmux -L "$SERVER" bind-key -n WheelUpPane if-shell -F '#{||:#{==:#{@workbench_surface},workbench-go-tui},#{==:#{@workbench_surface},workbench-ink}}' \
+  'send-keys PageUp' \
+  'if-shell -F "#{pane_in_mode}" "send-keys -M" "copy-mode -e; send-keys -M"' 2>/dev/null || true
+tmux -L "$SERVER" bind-key -n WheelDownPane if-shell -F '#{||:#{==:#{@workbench_surface},workbench-go-tui},#{==:#{@workbench_surface},workbench-ink}}' \
+  'send-keys PageDown' \
+  'send-keys -M' 2>/dev/null || true
 
 # Pane navigation within the current window (no-prefix). Avoid Alt+Arrow so Claude/shell keep word-jump.
-tmux -L "$SERVER" bind-key -n F6 select-pane -t :.+' 2>/dev/null || true
+tmux -L "$SERVER" bind-key -n F6 select-pane -t ":.+" 2>/dev/null || true
 tmux -L "$SERVER" bind-key -n F7 last-pane 2>/dev/null || true
 
 # Palette (Catppuccin-ish, readable on dark terminals)
