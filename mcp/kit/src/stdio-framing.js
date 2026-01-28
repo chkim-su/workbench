@@ -27,7 +27,12 @@ export class StdioMessageCodec {
         const bodyBytes = this.buffer.subarray(bodyStart, bodyEnd)
         this.buffer = this.buffer.subarray(bodyEnd)
 
-        messages.push(JSON.parse(bodyBytes.toString("utf8")))
+        try {
+          messages.push(JSON.parse(bodyBytes.toString("utf8")))
+        } catch (e) {
+          // Skip malformed JSON messages instead of crashing
+          console.error("[MCP] Failed to parse JSON message:", e.message)
+        }
         continue
       }
 
@@ -37,7 +42,12 @@ export class StdioMessageCodec {
       const line = this.buffer.subarray(0, newline + 1).toString("utf8").trim()
       this.buffer = this.buffer.subarray(newline + 1)
       if (!line) continue
-      messages.push(JSON.parse(line))
+      try {
+        messages.push(JSON.parse(line))
+      } catch (e) {
+        // Skip malformed JSON lines instead of crashing
+        console.error("[MCP] Failed to parse JSON line:", e.message)
+      }
     }
 
     return messages

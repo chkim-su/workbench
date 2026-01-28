@@ -10,7 +10,7 @@
       }
     },
     "workbench-docker": {
-      "command": "bun",
+      "command": "/home/chanhokim/.bun/bin/bun",
       "args": [
         "/home/chanhokim/projects/myLLMworkbench/mcp/servers/docker/src/index.js"
       ],
@@ -19,7 +19,7 @@
       }
     },
     "workbench-workflow": {
-      "command": "bun",
+      "command": "/home/chanhokim/.bun/bin/bun",
       "args": [
         "/home/chanhokim/projects/myLLMworkbench/mcp/servers/workflow/src/index.js"
       ],
@@ -28,7 +28,7 @@
       }
     },
     "workbench-registry": {
-      "command": "bun",
+      "command": "/home/chanhokim/.bun/bin/bun",
       "args": [
         "/home/chanhokim/projects/myLLMworkbench/mcp/servers/registry/src/index.js"
       ],
@@ -37,7 +37,7 @@
       }
     },
     "workbench-container": {
-      "command": "bun",
+      "command": "/home/chanhokim/.bun/bin/bun",
       "args": [
         "/home/chanhokim/projects/myLLMworkbench/mcp/servers/workbench-docker/src/index.js"
       ],
